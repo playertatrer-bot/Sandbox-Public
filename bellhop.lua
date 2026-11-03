@@ -52,7 +52,7 @@ local State = {
 	TicketESP = true,
 	Alert = true,
 	AutoTicket = false,
-	Escape = true,
+	Escape = false,
 }
 
 local Running = true
@@ -775,7 +775,8 @@ local function getAndGive()
 end
 
 -- Teleport away: open floor 80 to 150 studs from the nearest BellHop, where he gives up the chase.
-local function teleportAway()
+-- reason says why it happened, so an automatic escape never comes as a surprise.
+local function teleportAway(reason)
 	local found = bellhops()
 	if #found == 0 then
 		notify("No BellHop loaded")
@@ -803,7 +804,8 @@ local function teleportAway()
 				local headroom = workspace:Raycast(hit.Position + Vector3.new(0, 0.5, 0), Vector3.new(0, 6, 0), params)
 				if not headroom then
 					teleport(CFrame.new(hit.Position + Vector3.new(0, 3, 0)))
-					notify(string.format("Teleported %d studs away from the BellHop", distance))
+					local moved = string.format("moved you %d studs away from the BellHop", distance)
+					notify(reason and (reason .. ", " .. moved) or ("Teleport away " .. moved), false, THEME.Accent)
 					return true
 				end
 			end
@@ -832,14 +834,15 @@ local function ticketRun(fromAuto)
 	Busy = false
 	notify(message or "Done")
 	if not given and fromAuto and State.Escape then
-		teleportAway()
+		teleportAway("No ticket for him")
 	elseif not given and home then
 		teleport(home)
 	end
 end
 
--- Safe BellHop picture: let him target you from 14 studs, get a ticket and give it so he lets you
--- go, take the picture from 8 studs with the camera locked on him, then go back.
+-- Safe BellHop picture: gets a ticket first, so you are never near him without one.
+-- With the ticket in hand it stands 12 studs in front of him and takes the picture. If he
+-- charges, he takes the ticket and lets you go. No ticket means no picture: it never goes near him.
 local function safePicture()
 	if Busy then
 		return
@@ -857,30 +860,43 @@ local function safePicture()
 	local bellhop = found[1].Model
 
 	local ok, err = pcall(function()
-		local part = partOf(bellhop)
-		notify("Letting the BellHop target you", true, THEME.Accent)
-		local spot = part.Position + flatLook(part) * 14 + Vector3.new(0, 1, 0)
-		teleport(CFrame.lookAt(spot, Vector3.new(part.Position.X, spot.Y, part.Position.Z)))
-		local targeted = waitFor(function()
-			return targetsMe(bellhop) or spottedText(screenTexts())
-		end, 6)
-		log("targeted before picture: " .. tostring(targeted))
-
-		if targeted then
-			notify("Getting a ticket", true, THEME.Accent)
-			local given, reason = getAndGive()
-			if not given then
-				message = reason
+		if not holdingTicket() then
+			notify("Getting a ticket first", true, THEME.Accent)
+			local tickets = findTickets()
+			local open, got = 0, false
+			for _, ticket in ipairs(tickets) do
+				if not ticket.Locked then
+					open += 1
+					if collect(ticket) then
+						got = true
+						break
+					end
+					if open >= 3 then
+						break
+					end
+				end
+			end
+			if not got then
+				if #tickets == 0 then
+					message = "No ticket loaded, picture cancelled"
+				elseif open == 0 then
+					message = "Tickets are locked until he targets you, picture cancelled"
+				else
+					message = "Ticket pickup failed, picture cancelled"
+				end
+				return
 			end
 		end
+		log("holding a ticket before the picture: " .. tostring(holdingTicket()))
 
-		part = partOf(bellhop)
+		local part = partOf(bellhop)
 		if not part or not bellhop:IsDescendantOf(workspace) then
 			message = "BellHop unloaded"
 			return
 		end
-		local shotSpot = part.Position + flatLook(part) * 8 + Vector3.new(0, 1, 0)
+		local shotSpot = part.Position + flatLook(part) * 12 + Vector3.new(0, 1, 0)
 		teleport(CFrame.lookAt(shotSpot, Vector3.new(part.Position.X, shotSpot.Y, part.Position.Z)))
+		local arrived = os.clock()
 		camLock = RunService.RenderStepped:Connect(function()
 			local cam = workspace.CurrentCamera
 			local head = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
@@ -895,18 +911,25 @@ local function safePicture()
 			message = "No camera tool found"
 			return
 		end
+		local ticketTool = findTool({ "ticket" })
 		local _, hum = getCharacter()
 		if hum and camera.Parent ~= LocalPlayer.Character then
 			hum:EquipTool(camera)
-			task.wait(0.4)
+			task.wait(0.3)
 		end
-		for _ = 1, 2 do
-			pcall(function()
-				camera:Activate()
-			end)
-			task.wait(1.5)
+		pcall(function()
+			camera:Activate()
+		end)
+		-- If the ticket is a tool, it goes back in your hand right after the shot so he takes it.
+		task.wait(0.6)
+		if ticketTool and hum and ticketTool.Parent then
+			hum:EquipTool(ticketTool)
 		end
-		message = message or "Picture taken, check your album"
+		waitFor(function()
+			return LastTicketTake >= arrived
+		end, 2.5)
+		message = LastTicketTake >= arrived and "Picture taken, he took the ticket and let you go"
+			or "Picture taken, check your album"
 	end)
 
 	if camLock then
@@ -1062,7 +1085,7 @@ local TitleBar = create("Frame", {
 create("TextLabel", {
 	Size = UDim2.new(1, -30, 1, 0),
 	BackgroundTransparency = 1,
-	Text = "BellHop test v2",
+	Text = "BellHop test v3",
 	TextColor3 = THEME.Accent,
 	Font = Enum.Font.GothamBold,
 	TextSize = 14,
@@ -1175,7 +1198,7 @@ end
 addToggle("Ticket ESP", "TicketESP")
 addToggle("BellHop alert", "Alert")
 addToggle("Auto ticket", "AutoTicket")
-addToggle("Escape if stuck", "Escape")
+addToggle("Escape when he grabs", "Escape")
 addButtons({ { "Get ticket", ticketRun, true }, { "Teleport away", teleportAway } })
 addButtons({ { "Safe BellHop picture", safePicture, true } })
 addButtons({ { "Scan report", scanReport } })
@@ -1257,7 +1280,7 @@ local function update()
 	if State.Escape and danger and not Busy and os.clock() - LastGrab < 1 and not holdingTicket() then
 		LastGrab = 0
 		log("grab warning, escaping")
-		task.spawn(teleportAway)
+		task.spawn(teleportAway, "He grabbed at you with no ticket")
 	end
 
 	local unlocked = 0
@@ -1310,4 +1333,4 @@ end
 CloseButton.MouseButton1Click:Connect(unload)
 GlobalEnv.BellhopTestUnload = unload
 log("loaded, " .. #bellhops() .. " BellHop(s), " .. #findTickets() .. " ticket(s)")
-notify("BellHop test v2 loaded")
+notify("BellHop test v3 loaded")
