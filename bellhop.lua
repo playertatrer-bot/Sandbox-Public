@@ -1,8 +1,14 @@
--- BellHop test for Unseen Liminality
--- Ticket ESP, BellHop alert, Auto ticket, Get ticket, Safe BellHop picture, Teleport away, Scan report.
+-- BellHop test for Unseen Liminality, version 2
+-- Ticket ESP, BellHop alert, Auto ticket, Escape if stuck, Get ticket, Teleport away,
+-- Safe BellHop picture, Scan report with an event log.
 -- Standalone, so it can be tested before it goes into the main script.
--- After testing, tap Scan report and send it back. It lists the game's real names for the
--- BellHop, the tickets and their prompts, so the main script can match them exactly.
+--
+-- What the game uses, from the first scan report:
+--   BellHop: Workspace.GameObjects.NPCs.Bellhop, a Model with attribute AIType = "Bellhop".
+--            Sounds: Walk, Run, Vocal1, Vocal2, Grab, HatTip, TicketTake. Animation TicketTake.
+--   Ticket:  a Model named HotelTicket (MeshPart HotelTicket inside), picked up through the
+--            game's prompt handler (ProximityPromptHandler.Interactions.HotelTicket).
+--   Camera:  the tool named Camera.
 
 if not game:IsLoaded() then
 	game.Loaded:Wait()
@@ -11,7 +17,8 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 
 local LocalPlayer = Players.LocalPlayer
 local GuiParent = (gethui and gethui()) or game:GetService("CoreGui")
@@ -33,17 +40,19 @@ local THEME = {
 	Danger = Color3.fromRGB(200, 58, 58),
 	Track = Color3.fromRGB(52, 52, 60),
 	Ticket = Color3.fromRGB(255, 214, 90),
+	TicketLocked = Color3.fromRGB(150, 130, 70),
 	Bellhop = Color3.fromRGB(255, 70, 70),
 }
 
 local CAMERA_WORDS = { "camera", "cam", "photo", "polaroid", "snap" }
 local SPOT_WORDS = { "follow the music", "followthemusic" }
-local FRESH_TICKET = 45 -- seconds a newly spawned ticket counts as a sign the BellHop spotted you
+local CHARGE_RANGE = 100 -- studs. The BellHop running this close counts as charging at you.
 
 local State = {
 	TicketESP = true,
 	Alert = true,
 	AutoTicket = false,
+	Escape = true,
 }
 
 local Running = true
@@ -51,10 +60,26 @@ local Busy = false -- a ticket run or picture run is moving you around
 local Connections = {}
 local Tracked = { Bellhops = {}, Tickets = {}, Prompts = {} }
 local ESP = {}
+local Log = {}
+local LogStart = os.clock()
+local LastTicketTake = 0 -- when a BellHop last played his TicketTake sound or animation
+local LastGrab = 0 -- when a BellHop last played his Grab sound
+local MyKeys = {
+	string.lower(LocalPlayer.Name),
+	string.lower(LocalPlayer.DisplayName),
+	tostring(LocalPlayer.UserId),
+}
 
 local function track(conn)
 	table.insert(Connections, conn)
 	return conn
+end
+
+local function log(text)
+	table.insert(Log, string.format("[%6.1f] %s", os.clock() - LogStart, text))
+	if #Log > 150 then
+		table.remove(Log, 1)
+	end
 end
 
 local function create(className, props)
@@ -140,14 +165,76 @@ local function flatLook(part)
 	return flat.Unit
 end
 
--- Scanning: BellHop models, things named ticket, and every prompt on the map.
--- old marks things already there when the script started, so they do not count as fresh spawns.
+local function isBellhop(obj)
+	return obj:IsA("Model") and (obj:GetAttribute("AIType") == "Bellhop" or hasWord(obj.Name, "bellhop"))
+end
+
+local function isTicket(obj)
+	return (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) and hasWord(obj.Name, "ticket")
+end
+
+-- Hooks a BellHop once: its attribute changes, sounds and animations go into the event log.
+-- TicketTake proves a handover, Grab warns that he is about to get you.
+local hookedBellhops = {}
+local function hookBellhop(bellhop)
+	if hookedBellhops[bellhop] then
+		return
+	end
+	hookedBellhops[bellhop] = true
+	track(bellhop.AttributeChanged:Connect(function(key)
+		log(string.format("BellHop attribute %s = %s", key, tostring(bellhop:GetAttribute(key))))
+	end))
+	local function hookSound(sound)
+		track(sound.Played:Connect(function()
+			log("BellHop sound " .. sound.Name)
+			if hasWord(sound.Name, "tickettake") then
+				LastTicketTake = os.clock()
+			elseif hasWord(sound.Name, "grab") then
+				LastGrab = os.clock()
+			end
+		end))
+	end
+	for _, d in ipairs(bellhop:GetDescendants()) do
+		if d:IsA("Sound") then
+			hookSound(d)
+		end
+	end
+	track(bellhop.DescendantAdded:Connect(function(d)
+		if d:IsA("Sound") then
+			hookSound(d)
+		elseif d:IsA("Animator") then
+			track(d.AnimationPlayed:Connect(function(trackPlayed)
+				local name = trackPlayed.Animation and trackPlayed.Animation.Name or "?"
+				log("BellHop animation " .. name)
+				if hasWord(name, "tickettake") then
+					LastTicketTake = os.clock()
+				end
+			end))
+		end
+	end))
+	local animator = bellhop:FindFirstChildWhichIsA("Animator", true)
+	if animator then
+		track(animator.AnimationPlayed:Connect(function(trackPlayed)
+			local name = trackPlayed.Animation and trackPlayed.Animation.Name or "?"
+			log("BellHop animation " .. name)
+			if hasWord(name, "tickettake") then
+				LastTicketTake = os.clock()
+			end
+		end))
+	end
+end
+
+-- Scanning. old marks things already there when the script started, so they are not fresh spawns.
 local function consider(obj, old)
 	local stamp = old and 0 or os.clock()
-	if obj:IsA("Model") and hasWord(obj.Name, "bellhop") then
+	if isBellhop(obj) and not Tracked.Bellhops[obj] then
 		Tracked.Bellhops[obj] = true
+		hookBellhop(obj)
 	end
-	if (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Tool")) and hasWord(obj.Name, "ticket") then
+	if isTicket(obj) then
+		if not old and not insidePlayer(obj) then
+			log("ticket appeared: " .. obj:GetFullName())
+		end
 		Tracked.Tickets[obj] = stamp
 	elseif obj:IsA("ProximityPrompt") then
 		Tracked.Prompts[obj] = stamp
@@ -160,9 +247,29 @@ end
 track(workspace.DescendantAdded:Connect(function(obj)
 	consider(obj, false)
 end))
+track(workspace.DescendantRemoving:Connect(function(obj)
+	if Tracked.Tickets[obj] ~= nil and not insidePlayer(obj) then
+		log("ticket removed: " .. obj:GetFullName())
+	end
+end))
 
-local function nearestBellhop()
-	local best, bestDist = nil, math.huge
+-- The NPC folder gets checked every update too, since AIType can be set after a model loads.
+local function refreshBellhops()
+	local objects = workspace:FindFirstChild("GameObjects")
+	local npcs = objects and objects:FindFirstChild("NPCs")
+	if npcs then
+		for _, child in ipairs(npcs:GetChildren()) do
+			if isBellhop(child) and not Tracked.Bellhops[child] then
+				Tracked.Bellhops[child] = true
+				hookBellhop(child)
+			end
+		end
+	end
+end
+
+-- Every BellHop loaded, nearest first, as { Model, Part, Distance }.
+local function bellhops()
+	local list = {}
 	local origin = myPosition()
 	for obj in pairs(Tracked.Bellhops) do
 		if obj.Parent == nil then
@@ -170,47 +277,59 @@ local function nearestBellhop()
 		elseif obj:IsDescendantOf(workspace) and not insidePlayer(obj) then
 			local part = partOf(obj)
 			if part then
-				local dist = (part.Position - origin).Magnitude
-				if dist < bestDist then
-					best, bestDist = obj, dist
-				end
+				table.insert(list, { Model = obj, Part = part, Distance = (part.Position - origin).Magnitude })
 			end
 		end
 	end
-	return best, bestDist
+	table.sort(list, function(a, b)
+		return a.Distance < b.Distance
+	end)
+	return list
+end
+
+-- The BellHop is after you when one of his attributes or values names you.
+local function targetsMe(bellhop)
+	local function mine(value)
+		local text = string.lower(tostring(value))
+		for _, key in ipairs(MyKeys) do
+			if text == key then
+				return true
+			end
+		end
+		return false
+	end
+	for _, value in pairs(bellhop:GetAttributes()) do
+		if mine(value) then
+			return true
+		end
+	end
+	for _, child in ipairs(bellhop:GetChildren()) do
+		if child:IsA("ObjectValue") and (child.Value == LocalPlayer or child.Value == LocalPlayer.Character) then
+			return true
+		end
+		if child:IsA("StringValue") and mine(child.Value) then
+			return true
+		end
+	end
+	return false
+end
+
+local function running(bellhop)
+	for _, d in ipairs(bellhop:GetDescendants()) do
+		if d:IsA("Sound") and d.Name == "Run" and d.IsPlaying then
+			return true
+		end
+	end
+	return false
 end
 
 local function promptText(prompt)
 	return prompt.ObjectText .. " " .. prompt.ActionText .. " " .. prompt.Name
 end
 
--- The ticket's glowing aura: a light, particles, sparkles, a beam or a highlight on it.
-local function glows(obj)
-	local function check(root)
-		for _, d in ipairs(root:GetDescendants()) do
-			if d:IsA("ParticleEmitter") or d:IsA("Light") or d:IsA("Highlight") or d:IsA("Sparkles") or d:IsA("Beam") then
-				return true
-			end
-		end
-		return false
-	end
-	if check(obj) then
-		return true
-	end
-	local parent = obj.Parent
-	if parent and parent:IsA("Model") and parent ~= workspace then
-		local _, size = parent:GetBoundingBox()
-		if size.Magnitude < 12 then
-			return check(parent)
-		end
-	end
-	return false
-end
-
--- Tickets lying on the map, nearest first, as { Object, Part, Prompt, Distance, Stamp }.
--- A ticket is anything named ticket, or anything with a prompt that mentions a ticket.
--- loose also counts small glowing things with a prompt, in case the ticket has a plain name.
-local function findTickets(loose)
+-- Every ticket on the map, nearest first, as { Object, Part, Prompt, Distance, Stamp, Locked }.
+-- Locked means its prompt is off right now, which can mean it only works while you are the target.
+local function findTickets()
 	local list, seen = {}, {}
 	local origin = myPosition()
 	local function add(obj, prompt, stamp)
@@ -218,10 +337,10 @@ local function findTickets(loose)
 			return
 		end
 		local part = partOf(obj)
-		prompt = prompt or promptIn(obj)
-		if not part or (prompt and not prompt.Enabled) or (not prompt and part.Transparency >= 1) then
+		if not part then
 			return
 		end
+		prompt = prompt or promptIn(obj)
 		seen[obj] = true
 		table.insert(list, {
 			Object = obj,
@@ -229,9 +348,9 @@ local function findTickets(loose)
 			Prompt = prompt,
 			Distance = (part.Position - origin).Magnitude,
 			Stamp = stamp or 0,
+			Locked = prompt ~= nil and not prompt.Enabled,
 		})
 	end
-
 	for obj, stamp in pairs(Tracked.Tickets) do
 		if obj.Parent == nil then
 			Tracked.Tickets[obj] = nil
@@ -242,24 +361,20 @@ local function findTickets(loose)
 	for prompt, stamp in pairs(Tracked.Prompts) do
 		if prompt.Parent == nil then
 			Tracked.Prompts[prompt] = nil
-		elseif prompt.Enabled and prompt:IsDescendantOf(workspace) then
+		elseif prompt:IsDescendantOf(workspace) and hasWord(promptText(prompt), "ticket") then
 			local holder = prompt.Parent
 			if holder and holder:IsA("Attachment") then
 				holder = holder.Parent
 			end
 			if holder then
-				if hasWord(promptText(prompt), "ticket") then
-					add(holder, prompt, stamp)
-				elseif loose and glows(holder) then
-					local part = partOf(holder)
-					if part and part.Size.Magnitude < 6 then
-						add(holder, prompt, stamp)
-					end
-				end
+				add(holder, prompt, stamp)
 			end
 		end
 	end
 	table.sort(list, function(a, b)
+		if a.Locked ~= b.Locked then
+			return not a.Locked
+		end
 		return a.Distance < b.Distance
 	end)
 	return list
@@ -277,33 +392,109 @@ local function shown(obj)
 	return node == nil or node.Enabled
 end
 
--- "Follow The Music" on your screen means the BellHop spotted you.
-local function spottedText()
+-- Text on your screen, skipping the player list. Used for the spotted check and the event log.
+local function screenTexts()
+	local texts = {}
 	local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 	if not gui then
-		return false
+		return texts
 	end
 	for _, obj in ipairs(gui:GetDescendants()) do
-		if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.TextTransparency < 1 then
-			local text = string.lower(obj.ContentText)
-			for _, word in ipairs(SPOT_WORDS) do
-				if string.find(text, word, 1, true) and shown(obj) then
-					return true
-				end
+		if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.TextTransparency < 1 and obj.ContentText ~= "" then
+			if not hasWord(obj:GetFullName(), "playerlist") and shown(obj) then
+				texts[obj.ContentText] = true
+			end
+		end
+	end
+	return texts
+end
+
+local function spottedText(texts)
+	for text in pairs(texts) do
+		local lowered = string.lower(text)
+		for _, word in ipairs(SPOT_WORDS) do
+			if string.find(lowered, word, 1, true) then
+				return true
 			end
 		end
 	end
 	return false
 end
 
-local function freshTicket(tickets)
-	for _, ticket in ipairs(tickets) do
-		if ticket.Stamp > 0 and os.clock() - ticket.Stamp < FRESH_TICKET then
+-- A ticket in your hands: a ticket tool, something named ticket on your character, or a ticket
+-- attribute or value on your character or player.
+local function holdingTicket()
+	local function truthy(value)
+		return value ~= nil and value ~= false and value ~= 0 and value ~= ""
+	end
+	local char = LocalPlayer.Character
+	if char then
+		for _, d in ipairs(char:GetDescendants()) do
+			if hasWord(d.Name, "ticket") then
+				return true
+			end
+		end
+		for key, value in pairs(char:GetAttributes()) do
+			if hasWord(key, "ticket") and truthy(value) then
+				return true
+			end
+		end
+	end
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if backpack then
+		for _, child in ipairs(backpack:GetChildren()) do
+			if hasWord(child.Name, "ticket") then
+				return true
+			end
+		end
+	end
+	for key, value in pairs(LocalPlayer:GetAttributes()) do
+		if hasWord(key, "ticket") and truthy(value) then
 			return true
+		end
+	end
+	local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	for _, d in ipairs(LocalPlayer:GetDescendants()) do
+		if d:IsA("ValueBase") and hasWord(d.Name, "ticket") and not (gui and d:IsDescendantOf(gui)) then
+			local ok, value = pcall(function()
+				return d.Value
+			end)
+			if ok and truthy(value) then
+				return true
+			end
 		end
 	end
 	return false
 end
+
+-- Event log hooks: your attributes, character and backpack changes, and every prompt you trigger.
+track(LocalPlayer.AttributeChanged:Connect(function(key)
+	log(string.format("player attribute %s = %s", key, tostring(LocalPlayer:GetAttribute(key))))
+end))
+local function hookCharacter(char)
+	track(char.AttributeChanged:Connect(function(key)
+		log(string.format("character attribute %s = %s", key, tostring(char:GetAttribute(key))))
+	end))
+	track(char.ChildAdded:Connect(function(child)
+		log("character got " .. child.Name .. " (" .. child.ClassName .. ")")
+	end))
+	track(char.ChildRemoved:Connect(function(child)
+		log("character lost " .. child.Name)
+	end))
+end
+if LocalPlayer.Character then
+	hookCharacter(LocalPlayer.Character)
+end
+track(LocalPlayer.CharacterAdded:Connect(hookCharacter))
+local backpackNow = LocalPlayer:FindFirstChildOfClass("Backpack")
+if backpackNow then
+	track(backpackNow.ChildAdded:Connect(function(child)
+		log("backpack got " .. child.Name)
+	end))
+end
+track(ProximityPromptService.PromptTriggered:Connect(function(prompt)
+	log(string.format("prompt triggered %s on %s", prompt.Name, prompt.Parent and prompt.Parent:GetFullName() or "?"))
+end))
 
 -- Toast and alert banner
 local Screen = create("ScreenGui", {
@@ -334,6 +525,7 @@ create("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 
 
 local toastId = 0
 local function notify(text, sticky, color)
+	log("message: " .. text)
 	toastId += 1
 	local id = toastId
 	Toast.Text = text
@@ -341,7 +533,7 @@ local function notify(text, sticky, color)
 	Toast.BackgroundTransparency = 0.05
 	Toast.TextTransparency = 0
 	if not sticky then
-		task.delay(2.5, function()
+		task.delay(3, function()
 			if id == toastId and Toast.Parent then
 				Toast.BackgroundTransparency = 1
 				Toast.TextTransparency = 1
@@ -356,7 +548,7 @@ local Banner = create("TextLabel", {
 	Size = UDim2.fromOffset(0, 34),
 	AutomaticSize = Enum.AutomaticSize.X,
 	BackgroundColor3 = THEME.Danger,
-	Text = "BellHop spotted you! Find a ticket",
+	Text = "BellHop is after you! Get a ticket",
 	TextColor3 = THEME.Text,
 	Font = Enum.Font.GothamBold,
 	TextSize = 15,
@@ -366,7 +558,7 @@ local Banner = create("TextLabel", {
 corner(Banner, 10)
 create("UIPadding", { PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16), Parent = Banner })
 
--- ESP: tickets in gold, the BellHop in red, both through walls with distance.
+-- ESP: tickets in gold (dim gold while locked), BellHops in red, through walls with distance.
 local function espFor(target, color, label)
 	local entry = ESP[target]
 	if not entry then
@@ -376,8 +568,6 @@ local function espFor(target, color, label)
 		end
 		local highlight = create("Highlight", {
 			Adornee = target:IsA("Tool") and part or target,
-			FillColor = color,
-			OutlineColor = color,
 			FillTransparency = 0.55,
 			DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
 			Parent = EspFolder,
@@ -385,14 +575,13 @@ local function espFor(target, color, label)
 		local board = create("BillboardGui", {
 			Adornee = part,
 			AlwaysOnTop = true,
-			Size = UDim2.fromOffset(160, 24),
+			Size = UDim2.fromOffset(180, 24),
 			StudsOffset = Vector3.new(0, 2.5, 0),
 			Parent = EspFolder,
 		})
 		local text = create("TextLabel", {
 			Size = UDim2.fromScale(1, 1),
 			BackgroundTransparency = 1,
-			TextColor3 = color,
 			TextStrokeTransparency = 0.3,
 			Font = Enum.Font.GothamBold,
 			TextSize = 13,
@@ -401,20 +590,27 @@ local function espFor(target, color, label)
 		entry = { Highlight = highlight, Board = board, Text = text, Part = part }
 		ESP[target] = entry
 	end
+	entry.Highlight.FillColor = color
+	entry.Highlight.OutlineColor = color
+	entry.Text.TextColor3 = color
 	entry.Text.Text = string.format("%s [%dm]", label, math.floor((entry.Part.Position - myPosition()).Magnitude))
 	entry.Seen = true
 end
 
-local function syncESP(bellhop, tickets)
+local function syncESP(found, tickets)
 	for _, entry in pairs(ESP) do
 		entry.Seen = false
 	end
 	if State.TicketESP then
 		for _, ticket in ipairs(tickets) do
-			espFor(ticket.Object, THEME.Ticket, "Ticket")
+			if ticket.Locked then
+				espFor(ticket.Object, THEME.TicketLocked, "Ticket (locked)")
+			else
+				espFor(ticket.Object, THEME.Ticket, "Ticket")
+			end
 		end
-		if bellhop then
-			espFor(bellhop, THEME.Bellhop, "BellHop")
+		for _, bellhop in ipairs(found) do
+			espFor(bellhop.Model, THEME.Bellhop, "BellHop")
 		end
 	end
 	for target, entry in pairs(ESP) do
@@ -451,14 +647,17 @@ end
 -- Uses the executor's fireproximityprompt when it has one, otherwise holds the prompt itself.
 local function firePrompt(prompt)
 	if typeof(fireproximityprompt) == "function" and pcall(fireproximityprompt, prompt) then
+		log("fired " .. prompt.Name .. " with fireproximityprompt")
 		return true
 	end
-	return pcall(function()
+	local ok = pcall(function()
 		prompt.HoldDuration = 0
 		prompt:InputHoldBegin()
 		task.wait(0.1)
 		prompt:InputHoldEnd()
 	end)
+	log("fired " .. prompt.Name .. " with InputHoldBegin, " .. (ok and "ok" or "failed"))
+	return ok
 end
 
 local function touch(part)
@@ -487,101 +686,79 @@ local function findTool(words)
 	return nil
 end
 
--- A ticket in your hands: a ticket tool, something named ticket on your character,
--- or a ticket attribute or value on your player.
-local function holdingTicket()
-	if findTool({ "ticket" }) then
-		return true
-	end
-	local char = LocalPlayer.Character
-	if char then
-		for _, d in ipairs(char:GetDescendants()) do
-			if hasWord(d.Name, "ticket") then
-				return true
-			end
-		end
-	end
-	for key, value in pairs(LocalPlayer:GetAttributes()) do
-		if hasWord(key, "ticket") and value then
-			return true
-		end
-	end
-	local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	for _, d in ipairs(LocalPlayer:GetDescendants()) do
-		if d:IsA("ValueBase") and hasWord(d.Name, "ticket") and not (gui and d:IsDescendantOf(gui)) then
-			local ok, value = pcall(function()
-				return d.Value
-			end)
-			if ok and value and value ~= 0 and value ~= "" then
-				return true
-			end
-		end
-	end
-	return false
-end
-
-local function collect(entry)
-	local part = entry.Part
+local function collect(ticket)
+	local part = ticket.Part
+	log(string.format("going to ticket %s, %dm, prompt %s%s", ticket.Object:GetFullName(), math.floor(ticket.Distance),
+		ticket.Prompt and ticket.Prompt.Name or "none", ticket.Locked and " (locked)" or ""))
 	teleport(CFrame.new(part.Position + Vector3.new(0, 2.5, 0)))
-	task.wait(0.25)
-	if entry.Prompt then
-		firePrompt(entry.Prompt)
+	task.wait(0.3)
+	if ticket.Prompt then
+		firePrompt(ticket.Prompt)
 	end
 	touch(part)
-	local click = entry.Object:FindFirstChildWhichIsA("ClickDetector", true)
+	local click = ticket.Object:FindFirstChildWhichIsA("ClickDetector", true)
 	if click and typeof(fireclickdetector) == "function" then
 		pcall(fireclickdetector, click)
 	end
-	return waitFor(function()
+	local got = waitFor(function()
 		return holdingTicket()
-			or not entry.Object:IsDescendantOf(workspace)
-			or (entry.Prompt ~= nil and not entry.Prompt.Enabled)
+			or not ticket.Object:IsDescendantOf(workspace)
+			or part.Transparency >= 1
+			or (ticket.Prompt ~= nil and not ticket.Locked and not ticket.Prompt.Enabled)
 	end, 2.5)
+	log("pickup " .. (got and "confirmed" or "not confirmed") .. ", holding ticket: " .. tostring(holdingTicket()))
+	return got
 end
 
 -- Stands 3 studs in front of the BellHop holding the ticket and tries every way to hand it over:
--- his prompts, using the ticket, and touching him.
+-- his prompts, using the ticket, touching him. His TicketTake sound or animation confirms it.
 local function give()
-	local bellhop = nearestBellhop()
-	if not bellhop then
+	local found = bellhops()
+	local target = nil
+	for _, bellhop in ipairs(found) do
+		if targetsMe(bellhop.Model) then
+			target = bellhop
+			break
+		end
+	end
+	target = target or found[1]
+	if not target then
 		return false, "No BellHop loaded"
 	end
-	local part = partOf(bellhop)
 	local _, hum = getCharacter()
-	local ticket = findTool({ "ticket" })
-	if ticket and hum and ticket.Parent ~= LocalPlayer.Character then
-		hum:EquipTool(ticket)
+	local ticketTool = findTool({ "ticket" })
+	if ticketTool and hum and ticketTool.Parent ~= LocalPlayer.Character then
+		hum:EquipTool(ticketTool)
 		task.wait(0.2)
 	end
+	local part = target.Part
 	local spot = part.Position + flatLook(part) * 3
 	teleport(CFrame.lookAt(spot, Vector3.new(part.Position.X, spot.Y, part.Position.Z)))
+	local started = os.clock()
 	task.wait(0.2)
-	for _, prompt in ipairs(bellhop:GetDescendants()) do
+	for _, prompt in ipairs(target.Model:GetDescendants()) do
 		if prompt:IsA("ProximityPrompt") and prompt.Enabled then
 			firePrompt(prompt)
 		end
 	end
-	if ticket then
+	if ticketTool then
 		pcall(function()
-			ticket:Activate()
+			ticketTool:Activate()
 		end)
 	end
 	touch(part)
 	local given = waitFor(function()
-		return not holdingTicket() or not spottedText()
-	end, 3)
-	return given, given and "Ticket given, the BellHop backed off" or "He did not take the ticket"
+		return LastTicketTake >= started or not holdingTicket()
+	end, 3.5)
+	log("handover " .. (given and "confirmed" or "not confirmed"))
+	return given, given and "Ticket given, the BellHop let you go" or "He did not take the ticket"
 end
 
--- Waits up to 4 seconds for a ticket to spawn, picks up the nearest one that works, then gives it.
+-- Picks up the nearest ticket that works (up to 3 tries), then gives it.
 local function getAndGive()
-	local tickets = {}
-	waitFor(function()
-		tickets = findTickets(true)
-		return #tickets > 0
-	end, 4)
+	local tickets = findTickets()
 	if #tickets == 0 then
-		return false, "No ticket found"
+		return false, "No ticket loaded nearby, get closer to the hotel"
 	end
 	local got = false
 	for index = 1, math.min(#tickets, 3) do
@@ -591,13 +768,52 @@ local function getAndGive()
 		end
 	end
 	if not got then
-		return false, "Ticket pickup failed"
+		return false, "Ticket pickup failed, tap Scan report and send it"
 	end
 	notify("Got a ticket, giving it to the BellHop", true, THEME.Accent)
 	return give()
 end
 
-local function ticketRun()
+-- Teleport away: open floor 80 to 150 studs from the nearest BellHop, where he gives up the chase.
+local function teleportAway()
+	local found = bellhops()
+	if #found == 0 then
+		notify("No BellHop loaded")
+		return false
+	end
+	local part = found[1].Part
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = {}
+	for _, bellhop in ipairs(found) do
+		table.insert(ignore, bellhop.Model)
+	end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then
+			table.insert(ignore, plr.Character)
+		end
+	end
+	params.FilterDescendantsInstances = ignore
+	for _, distance in ipairs({ 150, 110, 80 }) do
+		for step = 0, 11 do
+			local angle = math.rad(step * 30)
+			local probe = part.Position + Vector3.new(math.sin(angle), 0, math.cos(angle)) * distance + Vector3.new(0, 20, 0)
+			local hit = workspace:Raycast(probe, Vector3.new(0, -60, 0), params)
+			if hit and hit.Normal.Y > 0.6 then
+				local headroom = workspace:Raycast(hit.Position + Vector3.new(0, 0.5, 0), Vector3.new(0, 6, 0), params)
+				if not headroom then
+					teleport(CFrame.new(hit.Position + Vector3.new(0, 3, 0)))
+					notify(string.format("Teleported %d studs away from the BellHop", distance))
+					return true
+				end
+			end
+		end
+	end
+	notify("No open floor far enough away")
+	return false
+end
+
+local function ticketRun(fromAuto)
 	if Busy then
 		return
 	end
@@ -608,22 +824,28 @@ local function ticketRun()
 	local ok, given, message = pcall(getAndGive)
 	if not ok then
 		message = "Ticket run failed: " .. tostring(given)
+		given = false
 	end
-	if home then
+	if given and home then
 		teleport(home)
 	end
 	Busy = false
 	notify(message or "Done")
+	if not given and fromAuto and State.Escape then
+		teleportAway()
+	elseif not given and home then
+		teleport(home)
+	end
 end
 
--- Safe BellHop picture: let him spot you from 14 studs, get a ticket and give it to him so he
--- stops chasing, take the picture from 8 studs with the camera locked on him, then go back.
+-- Safe BellHop picture: let him target you from 14 studs, get a ticket and give it so he lets you
+-- go, take the picture from 8 studs with the camera locked on him, then go back.
 local function safePicture()
 	if Busy then
 		return
 	end
-	local bellhop = nearestBellhop()
-	if not bellhop then
+	local found = bellhops()
+	if #found == 0 then
 		notify("No BellHop loaded")
 		return
 	end
@@ -632,17 +854,19 @@ local function safePicture()
 	local home = root and root.CFrame
 	local message = nil
 	local camLock = nil
+	local bellhop = found[1].Model
 
 	local ok, err = pcall(function()
 		local part = partOf(bellhop)
-		notify("Letting the BellHop spot you", true, THEME.Accent)
+		notify("Letting the BellHop target you", true, THEME.Accent)
 		local spot = part.Position + flatLook(part) * 14 + Vector3.new(0, 1, 0)
 		teleport(CFrame.lookAt(spot, Vector3.new(part.Position.X, spot.Y, part.Position.Z)))
-		local spotted = waitFor(function()
-			return spottedText() or freshTicket(findTickets(true))
+		local targeted = waitFor(function()
+			return targetsMe(bellhop) or spottedText(screenTexts())
 		end, 6)
+		log("targeted before picture: " .. tostring(targeted))
 
-		if spotted then
+		if targeted then
 			notify("Getting a ticket", true, THEME.Accent)
 			local given, reason = getAndGive()
 			if not given then
@@ -650,9 +874,8 @@ local function safePicture()
 			end
 		end
 
-		bellhop = nearestBellhop() or bellhop
 		part = partOf(bellhop)
-		if not part then
+		if not part or not bellhop:IsDescendantOf(workspace) then
 			message = "BellHop unloaded"
 			return
 		end
@@ -699,79 +922,65 @@ local function safePicture()
 	notify(message or "Done")
 end
 
--- Teleport away: the nearest open floor 80 to 150 studs from the BellHop. Far enough and he stops chasing.
-local function teleportAway()
-	local bellhop = nearestBellhop()
-	if not bellhop then
-		notify("No BellHop loaded")
-		return
-	end
-	local part = partOf(bellhop)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local ignore = { bellhop }
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr.Character then
-			table.insert(ignore, plr.Character)
-		end
-	end
-	params.FilterDescendantsInstances = ignore
-	for _, distance in ipairs({ 150, 110, 80 }) do
-		for step = 0, 11 do
-			local angle = math.rad(step * 30)
-			local probe = part.Position + Vector3.new(math.sin(angle), 0, math.cos(angle)) * distance + Vector3.new(0, 20, 0)
-			local hit = workspace:Raycast(probe, Vector3.new(0, -60, 0), params)
-			if hit and hit.Normal.Y > 0.6 then
-				local headroom = workspace:Raycast(hit.Position + Vector3.new(0, 0.5, 0), Vector3.new(0, 6, 0), params)
-				if not headroom then
-					teleport(CFrame.new(hit.Position + Vector3.new(0, 3, 0)))
-					notify(string.format("Teleported %d studs away from the BellHop", distance))
-					return
-				end
-			end
-		end
-	end
-	notify("No open floor far enough away")
-end
-
--- Scan report: everything the main script needs to match the game's names exactly.
+-- Scan report: the game's real names plus the event log of everything that just happened.
 local function scanReport()
 	local lines = {}
 	local function add(text)
 		table.insert(lines, text)
 	end
 	local origin = myPosition()
-	add(string.format("BellHop scan, place %d, %s", game.PlaceId, os.date("%Y-%m-%d %H:%M")))
+	add(string.format("BellHop scan v2, place %d, %s", game.PlaceId, os.date("%Y-%m-%d %H:%M")))
 
-	add("== BellHop models")
-	for obj in pairs(Tracked.Bellhops) do
-		if obj.Parent then
-			local part = partOf(obj)
-			add(string.format("%s (%s) %dm", obj:GetFullName(), obj.ClassName, part and math.floor((part.Position - origin).Magnitude) or -1))
-			for key, value in pairs(obj:GetAttributes()) do
-				add("  attribute " .. key .. " = " .. tostring(value))
+	add("== BellHops")
+	for _, bellhop in ipairs(bellhops()) do
+		add(string.format("%s %dm, targets you: %s, running: %s", bellhop.Model:GetFullName(), math.floor(bellhop.Distance),
+			tostring(targetsMe(bellhop.Model)), tostring(running(bellhop.Model))))
+		for key, value in pairs(bellhop.Model:GetAttributes()) do
+			add("  attribute " .. key .. " = " .. tostring(value))
+		end
+		for _, child in ipairs(bellhop.Model:GetChildren()) do
+			if child:IsA("ValueBase") then
+				local ok, value = pcall(function()
+					return child.Value
+				end)
+				add("  value " .. child.Name .. " = " .. tostring(ok and value))
 			end
-			for _, d in ipairs(obj:GetDescendants()) do
-				if d:IsA("ProximityPrompt") then
-					add(string.format("  prompt %s action=%q object=%q enabled=%s", d.Name, d.ActionText, d.ObjectText, tostring(d.Enabled)))
-				elseif d:IsA("Sound") then
-					add(string.format("  sound %s %s", d.Name, d.IsPlaying and "playing" or ""))
-				elseif d:IsA("ValueBase") or d:IsA("Script") or d:IsA("LocalScript") then
-					add("  " .. d.ClassName .. " " .. d.Name)
-				end
+		end
+		for _, d in ipairs(bellhop.Model:GetDescendants()) do
+			if d:IsA("ProximityPrompt") then
+				add(string.format("  prompt %s action=%q object=%q enabled=%s", d.Name, d.ActionText, d.ObjectText, tostring(d.Enabled)))
 			end
 		end
 	end
 
-	add("== Ticket candidates on the map")
-	for _, ticket in ipairs(findTickets(true)) do
-		add(string.format(
-			"%s (%s) %dm prompt=%s",
-			ticket.Object:GetFullName(),
-			ticket.Object.ClassName,
-			math.floor(ticket.Distance),
-			ticket.Prompt and string.format("%q/%q", ticket.Prompt.ActionText, ticket.Prompt.ObjectText) or "none"
-		))
+	add("== Every ticket in the world")
+	for _, ticket in ipairs(findTickets()) do
+		local obj = ticket.Object
+		add(string.format("%s (%s) %dm transparency=%.2f tags=%s", obj:GetFullName(), obj.ClassName, math.floor(ticket.Distance),
+			ticket.Part.Transparency, table.concat(CollectionService:GetTags(obj), ",")))
+		for key, value in pairs(obj:GetAttributes()) do
+			add("  attribute " .. key .. " = " .. tostring(value))
+		end
+		local prompt = ticket.Prompt
+		if prompt then
+			add(string.format("  prompt %s action=%q object=%q enabled=%s range=%d sight=%s hold=%.1f style=%s",
+				prompt.Name, prompt.ActionText, prompt.ObjectText, tostring(prompt.Enabled), prompt.MaxActivationDistance,
+				tostring(prompt.RequiresLineOfSight), prompt.HoldDuration, prompt.Style.Name))
+			for key, value in pairs(prompt:GetAttributes()) do
+				add("    prompt attribute " .. key .. " = " .. tostring(value))
+			end
+		else
+			add("  no prompt")
+		end
+		local kinds = {}
+		for _, d in ipairs(obj:GetDescendants()) do
+			kinds[d.ClassName] = (kinds[d.ClassName] or 0) + 1
+		end
+		local summary = {}
+		for kind, count in pairs(kinds) do
+			table.insert(summary, kind .. " x" .. count)
+		end
+		add("  contains " .. table.concat(summary, ", "))
 	end
 
 	add("== Prompts within 80 studs")
@@ -780,44 +989,32 @@ local function scanReport()
 			local part = partOf(prompt.Parent)
 			local dist = part and (part.Position - origin).Magnitude or math.huge
 			if dist <= 80 then
-				add(string.format("%s action=%q object=%q enabled=%s %dm", prompt:GetFullName(), prompt.ActionText, prompt.ObjectText, tostring(prompt.Enabled), math.floor(dist)))
+				add(string.format("%s action=%q object=%q enabled=%s %dm", prompt:GetFullName(), prompt.ActionText,
+					prompt.ObjectText, tostring(prompt.Enabled), math.floor(dist)))
 			end
-		end
-	end
-
-	add("== Templates in ReplicatedStorage named ticket, bellhop or music")
-	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-		if hasWord(d.Name, "ticket") or hasWord(d.Name, "bellhop") or hasWord(d.Name, "music") then
-			add(d:GetFullName() .. " (" .. d.ClassName .. ")")
 		end
 	end
 
 	add("== Text on your screen")
-	local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	local count = 0
-	if gui then
-		for _, d in ipairs(gui:GetDescendants()) do
-			if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.ContentText ~= "" and shown(d) and count < 40 then
-				count += 1
-				add(string.format("%s: %q", d:GetFullName(), d.ContentText))
-			end
+	for text in pairs(screenTexts()) do
+		add(string.format("%q", text))
+	end
+
+	add("== You")
+	add("holding a ticket: " .. tostring(holdingTicket()))
+	for key, value in pairs(LocalPlayer:GetAttributes()) do
+		add("player attribute " .. key .. " = " .. tostring(value))
+	end
+	local char = LocalPlayer.Character
+	if char then
+		for key, value in pairs(char:GetAttributes()) do
+			add("character attribute " .. key .. " = " .. tostring(value))
 		end
 	end
 
-	add("== Your tools and ticket state")
-	for _, holder in ipairs({ LocalPlayer.Character or false, LocalPlayer:FindFirstChildOfClass("Backpack") or false }) do
-		if holder then
-			for _, child in ipairs(holder:GetChildren()) do
-				if child:IsA("Tool") then
-					add("tool " .. child.Name .. " in " .. holder.Name)
-				end
-			end
-		end
-	end
-	add("holding a ticket: " .. tostring(holdingTicket()))
-	add("spotted text on screen: " .. tostring(spottedText()))
-	for key, value in pairs(LocalPlayer:GetAttributes()) do
-		add("player attribute " .. key .. " = " .. tostring(value))
+	add("== Event log, oldest first")
+	for _, line in ipairs(Log) do
+		add(line)
 	end
 
 	local report = table.concat(lines, "\n")
@@ -847,7 +1044,7 @@ create("UIPadding", {
 	PaddingBottom = UDim.new(0, 10),
 	Parent = Window,
 })
-create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = Window })
+create("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = Window })
 
 local order = 0
 local function nextOrder()
@@ -865,7 +1062,7 @@ local TitleBar = create("Frame", {
 create("TextLabel", {
 	Size = UDim2.new(1, -30, 1, 0),
 	BackgroundTransparency = 1,
-	Text = "BellHop test",
+	Text = "BellHop test v2",
 	TextColor3 = THEME.Accent,
 	Font = Enum.Font.GothamBold,
 	TextSize = 14,
@@ -901,7 +1098,7 @@ local Status = create("TextLabel", {
 
 local function addToggle(text, key)
 	local row = create("TextButton", {
-		Size = UDim2.new(1, 0, 0, 30),
+		Size = UDim2.new(1, 0, 0, 28),
 		BackgroundColor3 = THEME.Surface,
 		AutoButtonColor = false,
 		Text = "",
@@ -978,6 +1175,7 @@ end
 addToggle("Ticket ESP", "TicketESP")
 addToggle("BellHop alert", "Alert")
 addToggle("Auto ticket", "AutoTicket")
+addToggle("Escape if stuck", "Escape")
 addButtons({ { "Get ticket", ticketRun, true }, { "Teleport away", teleportAway } })
 addButtons({ { "Safe BellHop picture", safePicture, true } })
 addButtons({ { "Scan report", scanReport } })
@@ -1015,35 +1213,69 @@ do
 	end))
 end
 
--- Main loop: spotted check, alert, auto ticket, ESP and status, about 3 times a second.
-local wasSpotted = false
+-- Main loop, about 3 times a second: target check, alert, auto ticket, escape, ESP, status, text log.
+local wasTargeted = false
+local lastTexts = {}
 local function update()
-	local bellhop, bellDist = nearestBellhop()
-	local spotted = spottedText()
-	local tickets = findTickets(spotted)
-	if not spotted and bellhop then
-		spotted = freshTicket(tickets)
-	end
+	refreshBellhops()
+	local found = bellhops()
+	local tickets = findTickets()
+	local texts = screenTexts()
 
-	Banner.Visible = State.Alert and spotted
-	if spotted and not wasSpotted then
+	for text in pairs(texts) do
+		if not lastTexts[text] then
+			log(string.format("screen text: %q", string.sub(text, 1, 80)))
+		end
+	end
+	lastTexts = texts
+
+	local targeted = spottedText(texts)
+	local charging = false
+	for _, bellhop in ipairs(found) do
+		if targetsMe(bellhop.Model) then
+			targeted = true
+		end
+		if bellhop.Distance <= CHARGE_RANGE and running(bellhop.Model) then
+			charging = true
+		end
+	end
+	local danger = targeted or charging
+
+	Banner.Visible = State.Alert and danger
+	if danger and not wasTargeted then
+		log("danger started, targeted: " .. tostring(targeted) .. ", charging: " .. tostring(charging))
 		if State.Alert then
-			notify("BellHop spotted you, find a ticket", false, THEME.Danger)
+			notify("BellHop is after you, get a ticket", false, THEME.Danger)
 		end
 		if State.AutoTicket and not Busy then
-			task.spawn(ticketRun)
+			task.spawn(ticketRun, true)
 		end
 	end
-	wasSpotted = spotted
+	wasTargeted = danger
 
+	-- Grab warning while he is after you and you have no ticket: get out.
+	if State.Escape and danger and not Busy and os.clock() - LastGrab < 1 and not holdingTicket() then
+		LastGrab = 0
+		log("grab warning, escaping")
+		task.spawn(teleportAway)
+	end
+
+	local unlocked = 0
+	for _, ticket in ipairs(tickets) do
+		if not ticket.Locked then
+			unlocked += 1
+		end
+	end
+	local nearest = found[1]
 	Status.Text = string.format(
-		"BellHop: %s   Tickets: %d\nSpotted: %s%s",
-		bellhop and (math.floor(bellDist) .. "m") or "not loaded",
+		"BellHop: %s   Tickets: %d (%d open)\nAfter you: %s%s",
+		nearest and string.format("%dm %s", math.floor(nearest.Distance), tostring(nearest.Model:GetAttribute("State") or "")) or "not loaded",
 		#tickets,
-		spotted and "yes" or "no",
+		unlocked,
+		targeted and "yes" or (charging and "charging" or "no"),
 		Busy and "   working..." or ""
 	)
-	syncESP(bellhop, tickets)
+	syncESP(found, tickets)
 end
 
 task.spawn(function()
@@ -1077,4 +1309,5 @@ end
 
 CloseButton.MouseButton1Click:Connect(unload)
 GlobalEnv.BellhopTestUnload = unload
-notify("BellHop test loaded")
+log("loaded, " .. #bellhops() .. " BellHop(s), " .. #findTickets() .. " ticket(s)")
+notify("BellHop test v2 loaded")
