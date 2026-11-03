@@ -1,3 +1,8 @@
+-- After a server hop the script starts before the game finishes loading.
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
 local EXTRA_ENTITY_NAMES = {}
 
 local Players = game:GetService("Players")
@@ -20,7 +25,8 @@ local WHITE = Color3.new(1, 1, 1)
 local RENDER_NAME = "BackroomsEnvironment"
 local SWAY_GUARD_NAME = "BackroomsSwayGuard"
 local SWAY_FIX_NAME = "BackroomsSwayFix"
-local RENDER_NAMES = { RENDER_NAME, SWAY_GUARD_NAME, SWAY_FIX_NAME }
+local HOLD_NAME = "BackroomsHold"
+local RENDER_NAMES = { RENDER_NAME, SWAY_GUARD_NAME, SWAY_FIX_NAME, HOLD_NAME }
 
 local DISCORD_INVITE = "https://discord.gg/cVfEXUwGDT"
 local LINK_COLOR = "rgb(88,166,255)"
@@ -72,6 +78,12 @@ local State = {
 	EntityAlert = false,
 	AlertRange = 60,
 	TpDistance = 30,
+	PullToCamera = false,
+	FloatHeight = 12,
+	PhotoWindow = 8,
+	AutoShot = true,
+	ClearView = true,
+	PumpkinESP = false,
 	InstantInteract = false,
 	AntiAfk = false,
 }
@@ -82,12 +94,15 @@ local RANGES = {
 	FlySpeed = { 10, 300, 5 },
 	AlertRange = { 20, 300, 10 },
 	TpDistance = { 10, 100, 5 },
+	FloatHeight = { 4, 30, 1 },
+	PhotoWindow = { 3, 20, 1 },
 }
 
 local SAVED_KEYS = {
 	"Fullbright", "NoFog", "CustomFov", "FovValue", "FirstPerson", "NoSway",
 	"SpeedValue", "FlySpeed", "PlayerESP", "EntityESP", "ItemESP",
-	"EntityAlert", "AlertRange", "TpDistance", "InstantInteract", "AntiAfk",
+	"EntityAlert", "AlertRange", "TpDistance", "PullToCamera", "FloatHeight", "PhotoWindow", "AutoShot",
+	"ClearView", "PumpkinESP", "InstantInteract", "AntiAfk",
 }
 
 local CONFIG_FILE = "Backrooms_config.json"
@@ -149,6 +164,7 @@ local ESP_COLORS = {
 	Player = Color3.fromRGB(80, 170, 255),
 	Entity = Color3.fromRGB(255, 70, 70),
 	Item = Color3.fromRGB(255, 220, 80),
+	Pumpkin = Color3.fromRGB(90, 230, 110),
 }
 
 local Connections = {}
@@ -263,12 +279,18 @@ pad(Toast, 14, 14, 0, 0)
 local ToastStroke = stroke(Toast, THEME.Stroke, 1)
 local toastId = 0
 
-local function notify(text)
+-- sticky keeps the toast up until the next notify replaces it.
+local function notify(text, sticky, color)
 	toastId += 1
 	local id = toastId
 	Toast.Text = text
+	Toast.TextColor3 = color or THEME.Text
+	ToastStroke.Color = color or THEME.Stroke
 	tween(Toast, { BackgroundTransparency = 0.05, TextTransparency = 0 })
 	tween(ToastStroke, { Transparency = 0 })
+	if sticky then
+		return
+	end
 	task.delay(2.5, function()
 		if id == toastId and Toast.Parent then
 			tween(Toast, { BackgroundTransparency = 1, TextTransparency = 1 }, 0.3)
@@ -725,6 +747,27 @@ end
 
 local ESP = {}
 local Entities = {}
+-- Auto take picture state in one table to stay under the Luau 200 local limit.
+local Bring = {
+	Held = nil, -- entity being held, with its saved state
+	Hover = nil, -- spot you float at during a picture run
+	Running = false, -- a picture run is in progress
+	Token = 0, -- bumps on cancel
+	Cleared = {}, -- parts hidden on your screen for the shot, with their saved state
+	RemoteLog = {}, -- remote calls the game made during the current shot, as { remote, time }
+	Noise = { Remotes = {}, Sources = {} }, -- signals that fire on their own, ignored as proof
+	PhotoRemote = nil, -- the remote that proved a picture, learned on the first confirmed shot
+	Unhook = nil, -- removes the remote watch
+}
+
+-- Halloween 2026 green pumpkins.
+local Pumpkin = {
+	Found = {}, -- every pumpkin-named Model or part seen in workspace
+	Done = {}, -- pumpkins with a shot taken this session
+	Rows = {}, -- list rows by pumpkin
+	Targets = {}, -- latest scan, nearest first, refreshed every second
+	Confirmed = false, -- the latest scan found pumpkins that read as green
+}
 local WatchedFolders = {}
 local Prompts = {}
 local Clickers = {}
@@ -820,6 +863,20 @@ local function watchFolder(folder)
 end
 
 local function consider(obj)
+	-- Pumpkins: "pumpkin" in the name, or in an attribute on a Model.
+	if string.find(string.lower(obj.Name), "pumpkin", 1, true) then
+		if obj:IsA("Model") or obj:IsA("BasePart") then
+			Pumpkin.Found[obj] = true
+		end
+	elseif obj:IsA("Model") then
+		for key, value in pairs(obj:GetAttributes()) do
+			local attr = string.lower(key) .. " " .. (type(value) == "string" and string.lower(value) or "")
+			if string.find(attr, "pumpkin", 1, true) then
+				Pumpkin.Found[obj] = true
+				break
+			end
+		end
+	end
 	local class = obj.ClassName
 	if class == "Humanoid" then
 		local model = obj.Parent
@@ -893,7 +950,7 @@ local function addESP(target, kind, name)
 		Adornee = root,
 		AlwaysOnTop = true,
 		Size = UDim2.fromOffset(200, 30),
-		StudsOffset = Vector3.new(0, kind == "Item" and 1.5 or 3.5, 0),
+		StudsOffset = Vector3.new(0, (kind == "Item" or kind == "Pumpkin") and 1.5 or 3.5, 0),
 		MaxDistance = kind == "Item" and 300 or 2000,
 		Parent = ESPFolder,
 	})
@@ -954,6 +1011,16 @@ local function collectWanted()
 		end
 	end
 
+	if State.PumpkinESP and Pumpkin.Targets then
+		local label = Pumpkin.Confirmed and "Green Pumpkin" or "Pumpkin"
+		for _, entry in ipairs(Pumpkin.Targets) do
+			local obj = entry.Target
+			if obj:IsDescendantOf(workspace) and not want[obj] then
+				want[obj] = { "Pumpkin", label }
+			end
+		end
+	end
+
 	return want
 end
 
@@ -971,9 +1038,9 @@ end
 
 local function maintain()
 	for obj, source in pairs(Entities) do
-		if not obj:IsDescendantOf(workspace) then
-			Entities[obj] = nil
-		elseif source == "humanoid" and not obj:FindFirstChildOfClass("Humanoid") then
+		if not obj:IsDescendantOf(workspace)
+			or (source == "humanoid" and not obj:FindFirstChildOfClass("Humanoid"))
+		then
 			Entities[obj] = nil
 		end
 	end
@@ -1037,7 +1104,7 @@ local function updateAlert()
 	local nearestName = nil
 	local nearestDist = math.huge
 	for obj in pairs(Entities) do
-		if obj:IsDescendantOf(workspace) and not isPlayerCharacter(obj) then
+		if obj:IsDescendantOf(workspace) and not isPlayerCharacter(obj) and not (Bring.Held and Bring.Held.Mode == "pull" and Bring.Held.Entity == obj) then
 			local root = getRoot(obj)
 			if root then
 				local dist = (rootPosition(root) - origin).Magnitude
@@ -1152,14 +1219,20 @@ local function awayFromEntities(spot, target)
 	return true
 end
 
+local function hasSight(eye, point)
+	return workspace:Raycast(eye, point - eye, FloorRay) == nil
+end
+
+-- Returns the first spot with a clear line to the entity, or the first open spot if none has one.
 local function findSafeSpot(target, targetRoot, distance, height)
 	local center = targetRoot.Position
 	local behind = flatUnit(-targetRoot.CFrame.LookVector) or Vector3.new(1, 0, 0)
 	local baseFloor = findFloor(center + Vector3.new(0, 1, 0), 40)
 	local probeY = baseFloor and baseFloor.Y + 3 or center.Y + 1
 
+	local fallback = nil
 	for _, scale in ipairs(TP_SCALES) do
-		local radius = math.max(distance * scale, MIN_TP_DISTANCE)
+		local radius = math.max(distance * scale, math.min(MIN_TP_DISTANCE, distance))
 		for _, angle in ipairs(TP_ANGLES) do
 			local direction = CFrame.Angles(0, math.rad(angle), 0):VectorToWorldSpace(behind)
 			local probe = Vector3.new(center.X, probeY, center.Z) + direction * radius
@@ -1169,11 +1242,14 @@ local function findSafeSpot(target, targetRoot, distance, height)
 				and hasRoom(floor, height)
 				and awayFromEntities(floor, target)
 			then
-				return floor
+				if hasSight(floor + Vector3.new(0, height, 0), center) then
+					return floor
+				end
+				fallback = fallback or floor
 			end
 		end
 	end
-	return nil
+	return fallback
 end
 
 local function rootHeight(hum, root)
@@ -1183,34 +1259,344 @@ local function rootHeight(hum, root)
 	return root.Size.Y / 2 + 2
 end
 
-local function teleportToEntity(target)
-	if not target or not target:IsDescendantOf(workspace) then
-		notify("Pick an entity from the list")
+-- Auto take picture holds the entity in one of two modes.
+-- lock (default): the entity stays where the server has it and your camera stays on it.
+-- pull: pins the entity in front of your camera. Server owned entities get anchored locally,
+-- so the photo sees a position the server never had. That gap trips the PS kick.
+-- Grouped in one table to stay under the Luau 200 local limit.
+local HOLD = {
+	Fill = 0.6, -- share of the view height a pulled entity fills
+	MinDistance = 6,
+	LeashSlack = 15, -- pull mode
+	LockSlack = 6, -- lock mode
+	Settle = 0.4, -- seconds for the server to register a teleport
+	PumpkinNear = 6, -- landing distance from a pumpkin, close enough for a big clear shot
+	MinGap = 2, -- smallest gap between the entity's head and your feet when floating
+	Grace = 0.4, -- seconds you stay after a confirmed picture
+	Confirm = 1.2, -- seconds to wait for proof of a picture before the next try
+	Baseline = 0.3, -- seconds of listening before the first try, to learn background noise
+	CameraWords = { "camera", "cam", "photo", "polaroid", "snap" },
+}
+
+local HoldRay = RaycastParams.new()
+HoldRay.FilterType = Enum.RaycastFilterType.Exclude
+HoldRay.IgnoreWater = true
+pcall(function()
+	HoldRay.RespectCanCollide = true
+end)
+
+-- Sight checks count every queryable part, collidable or not, the same as a default raycast.
+Bring.SightRay = RaycastParams.new()
+Bring.SightRay.FilterType = Enum.RaycastFilterType.Exclude
+Bring.SightRay.IgnoreWater = true
+
+-- Clear view hides blocking parts on your screen only and lets raycasts pass through them.
+-- Nothing replicates. restoreCleared puts every part back the way it was.
+local function restoreCleared()
+	for part, saved in pairs(Bring.Cleared) do
+		if part.Parent then
+			pcall(function()
+				-- CanQuery goes first. It must be true before CanCollide turns back on.
+				part.CanQuery = saved[2]
+				part.CanCollide = saved[1]
+				part.LocalTransparencyModifier = saved[3]
+				for decal, value in pairs(saved[4]) do
+					if decal.Parent then
+						decal.LocalTransparencyModifier = value
+					end
+				end
+			end)
+		end
+	end
+	table.clear(Bring.Cleared)
+end
+
+-- True when nothing sits between origin and the entity. During a run with Clear view on,
+-- each blocker gets cleared and the ray goes again. Terrain stays.
+local function hasClearView(entity, origin, center)
+	local ignore = { entity }
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then
+			table.insert(ignore, plr.Character)
+		end
+	end
+	Bring.SightRay.FilterDescendantsInstances = ignore
+	local clearing = State.ClearView and Bring.Running
+	for _ = 1, 24 do
+		local hit = workspace:Raycast(origin, center - origin, Bring.SightRay)
+		if not hit then
+			return true
+		end
+		local part = hit.Instance
+		if not clearing or part:IsA("Terrain") or Bring.Cleared[part] then
+			return false
+		end
+		local cleared = pcall(function()
+			local decals = {}
+			for _, child in ipairs(part:GetChildren()) do
+				if child:IsA("Decal") then
+					decals[child] = child.LocalTransparencyModifier
+					child.LocalTransparencyModifier = 1
+				end
+			end
+			Bring.Cleared[part] = { part.CanCollide, part.CanQuery, part.LocalTransparencyModifier, decals }
+			part.CanCollide = false
+			part.CanQuery = false
+			part.LocalTransparencyModifier = 1
+		end)
+		if not cleared then
+			return false
+		end
+	end
+	return false
+end
+
+local function yawOf(vector)
+	return math.atan2(-vector.X, -vector.Z)
+end
+
+local function boundsOf(target)
+	if target:IsA("Model") then
+		return target:GetBoundingBox()
+	end
+	return target.CFrame, target.Size
+end
+
+
+local function aimCamera(target)
+	local cam = workspace.CurrentCamera
+	if not cam or not target:IsDescendantOf(workspace) then
+		return
+	end
+	local box = boundsOf(target)
+	cam.CFrame = CFrame.lookAt(cam.CFrame.Position, box.Position)
+end
+
+local function releaseHeld()
+	local held = Bring.Held
+	if not held then
+		return nil
+	end
+	Bring.Held = nil
+	local entity = held.Entity
+	if held.Origin and not held.Owned and entity:IsDescendantOf(workspace) then
+		pcall(function()
+			entity:PivotTo(held.Origin)
+		end)
+	end
+	for part, saved in pairs(held.Parts) do
+		if part.Parent then
+			part.CanCollide = saved[1]
+			part.CanTouch = saved[2]
+		end
+	end
+	if held.Anchor and held.Anchor.Parent then
+		held.Anchor.Anchored = held.WasAnchored
+	end
+	return entity
+end
+
+-- Lock mode: aim at the real entity, release if it walks out of range, flag blocked views.
+local function lockStep(held)
+	local entity = held.Entity
+	local center = boundsOf(entity).Position
+	local _, _, myRoot = getCharacter()
+	if myRoot and (myRoot.Position - center).Magnitude > held.Leash then
+		releaseHeld()
+		notify(entity.Name .. " moved away, try again")
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	-- During a run the camera sits at your head, the spot the server sees you at.
+	local hover = Bring.Hover
+	local origin = cam.CFrame.Position
+	if hover and hover.Eye then
+		origin = hover.Eye
+	elseif Bring.Running then
+		local head = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head")
+		if head then
+			origin = head.Position
+		end
+	end
+	local up = Vector3.yAxis
+	if hover and math.abs((center - origin).Unit.Y) > 0.97 then
+		up = hover.Direction
+	end
+	cam.CFrame = CFrame.lookAt(origin, center, up)
+	local clear = hasClearView(entity, origin, center)
+	if clear ~= held.Clear then
+		held.Clear = clear
+		if clear then
+			notify("Ready!", false, THEME.Accent)
+		else
+			notify("View blocked", true, THEME.Danger)
+		end
+	end
+end
+
+local function pinHeld()
+	local held = Bring.Held
+	if not held then
+		return
+	end
+	local entity = held.Entity
+	if not held.Root:IsDescendantOf(workspace) then
+		releaseHeld()
+		notify(entity.Name .. " unloaded")
+		return
+	end
+	if held.Mode == "lock" then
+		lockStep(held)
+		return
+	end
+	-- The server still sees the entity at RealPosition. Drop the hold before a shot from too far out.
+	local _, _, myRoot = getCharacter()
+	if myRoot and (myRoot.Position - held.RealPosition).Magnitude > held.Leash then
+		releaseHeld()
+		notify("You moved away, hold released")
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
 		return
 	end
 
+	local camCF = cam.CFrame
+	local look = camCF.LookVector
+	local minDistance = math.max(held.Radius + 2, HOLD.MinDistance)
+	local fit = held.Span / (2 * math.tan(math.rad(cam.FieldOfView) / 2) * HOLD.Fill)
+	local distance = math.max(fit, minDistance)
+
+	HoldRay.FilterDescendantsInstances = { entity, LocalPlayer.Character }
+	local hit = workspace:Raycast(camCF.Position, look * distance, HoldRay)
+	if hit then
+		distance = math.max(hit.Distance - held.Radius, minDistance)
+	end
+
+	local center = camCF.Position + look * distance
+	local facing = flatUnit(camCF.Position - center) or flatUnit(-camCF.UpVector) or Vector3.new(0, 0, 1)
+	local rotation = CFrame.Angles(0, yawOf(facing) - held.BaseYaw, 0) * held.BaseRotation
+	local rootCF = CFrame.new(center - rotation:VectorToWorldSpace(held.CenterInRoot)) * rotation
+	entity:PivotTo(rootCF * held.PivotInRoot)
+	held.Anchor.AssemblyLinearVelocity = Vector3.zero
+	held.Anchor.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function safePin()
+	if not Bring.Held then
+		return
+	end
+	local ok, err = pcall(pinHeld)
+	if not ok then
+		pcall(releaseHeld)
+		warn("[Backrooms] " .. tostring(err))
+		notify("Hold dropped")
+	end
+end
+
+local function grabEntity(entity, mode)
+	local root = getRoot(entity)
+	if not root or not root:IsA("BasePart") then
+		notify(entity.Name .. " has no body to hold")
+		return false
+	end
+
+	if mode == "lock" then
+		local _, _, myRoot = getCharacter()
+		local reach = myRoot and (myRoot.Position - root.Position).Magnitude or 0
+		Bring.Held = {
+			Entity = entity,
+			Root = root,
+			Mode = "lock",
+			Parts = {},
+			Leash = math.max(reach, 10) + HOLD.LockSlack,
+			Clear = nil,
+		}
+		pinHeld()
+		return true
+	end
+
+	local anchor = root.AssemblyRootPart or root
+	-- isnetworkowner says whether your client simulates the entity. Unknown counts as not owned.
+	local owned = false
+	if typeof(isnetworkowner) == "function" then
+		local checked, result = pcall(isnetworkowner, anchor)
+		owned = checked and result == true
+	end
+	local rootCF = root.CFrame
+	local pivot = entity:GetPivot()
+	local box, size = boundsOf(entity)
+
+	local parts = {}
+	local list = entity:GetDescendants()
+	if entity:IsA("BasePart") then
+		table.insert(list, entity)
+	end
+	for _, part in ipairs(list) do
+		if part:IsA("BasePart") then
+			parts[part] = { part.CanCollide, part.CanTouch }
+			part.CanCollide = false
+			part.CanTouch = false
+		end
+	end
+
+	local wasAnchored = anchor.Anchored
+	if not owned then
+		anchor.Anchored = true
+	end
+
+	local _, _, myRoot = getCharacter()
+	local start = root.Position
+	local reach = myRoot and (myRoot.Position - start).Magnitude or 0
+
+	Bring.Held = {
+		Entity = entity,
+		Root = root,
+		Mode = "pull",
+		RealPosition = start,
+		Leash = reach + HOLD.LeashSlack,
+		Anchor = anchor,
+		WasAnchored = wasAnchored,
+		Owned = owned,
+		Parts = parts,
+		Origin = pivot,
+		PivotInRoot = rootCF:ToObjectSpace(pivot),
+		CenterInRoot = rootCF:PointToObjectSpace(box.Position),
+		BaseRotation = rootCF.Rotation,
+		BaseYaw = yawOf(flatUnit(rootCF.LookVector) or Vector3.new(0, 0, -1)),
+		Span = math.max(size.X, size.Y, size.Z),
+		Radius = size.Magnitude / 2,
+	}
+	pinHeld()
+	return true
+end
+
+-- Streams the entity in and returns its root, or nil and a reason.
+local function resolveTarget(target)
+	if not target or not target:IsDescendantOf(workspace) then
+		return nil, "Pick an entity from the list"
+	end
 	local targetRoot = getRoot(target)
 	if workspace.StreamingEnabled and targetRoot then
 		pcall(function()
 			LocalPlayer:RequestStreamAroundAsync(rootPosition(targetRoot), 3)
 		end)
 		if not target:IsDescendantOf(workspace) then
-			notify("The entity left before the teleport")
-			return
+			return nil, "The entity left before the teleport"
 		end
 		targetRoot = getRoot(target)
 	end
 	if not targetRoot or not targetRoot:IsA("BasePart") then
-		notify(target.Name .. " has no body to aim at")
-		return
+		return nil, target.Name .. " has no body to aim at"
 	end
+	return targetRoot
+end
 
-	local char, hum, root = getCharacter()
-	if not char or not hum or not root or hum.Health <= 0 then
-		notify("Your character is not ready")
-		return
-	end
-
+-- extra is the target, so the floor search never lands on top of it.
+local function prepareSearch(extra)
 	local players = {}
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if plr.Character then
@@ -1222,41 +1608,204 @@ local function teleportToEntity(target)
 		table.insert(ignore, ent)
 	end
 	table.insert(ignore, Probe)
+	if extra then
+		table.insert(ignore, extra)
+	end
 	local spaceIgnore = table.clone(players)
 	table.insert(spaceIgnore, Probe)
 	FloorRay.FilterDescendantsInstances = ignore
 	SpaceCheck.FilterDescendantsInstances = spaceIgnore
+end
+
+-- Moves you to a safe spot near the entity. keepReturn leaves an existing Return spot in place.
+local function landNear(target, distance, keepReturn)
+	local targetRoot, reason = resolveTarget(target)
+	if not targetRoot then
+		return false, reason
+	end
+
+	local char, hum, root = getCharacter()
+	if not char or not hum or not root or hum.Health <= 0 then
+		return false, "Your character is not ready"
+	end
+
+	prepareSearch(target)
 
 	local height = math.clamp(char:GetExtentsSize().Y - 0.5, 3, 7)
 	Probe.Parent = workspace.CurrentCamera or workspace
-	local searched, floor = pcall(findSafeSpot, target, targetRoot, State.TpDistance, height)
+	local searched, floor = pcall(findSafeSpot, target, targetRoot, distance, height)
 	Probe.Parent = nil
 	if not searched then
 		error(floor, 0)
 	end
 	if not floor then
-		notify("No safe spot near " .. target.Name)
-		return
+		return false, "No safe spot near " .. target.Name
 	end
 
 	local standPos = floor + Vector3.new(0, rootHeight(hum, root) + 0.25, 0)
 	local focus = Vector3.new(targetRoot.Position.X, standPos.Y, targetRoot.Position.Z)
-	ReturnCFrame = root.CFrame
+	if not keepReturn or not ReturnCFrame then
+		ReturnCFrame = root.CFrame
+	end
 	root.CFrame = CFrame.lookAt(standPos, focus)
 	root.AssemblyLinearVelocity = Vector3.zero
-	notify(string.format("Landed %dm from %s", math.floor((focus - standPos).Magnitude), target.Name))
+	return true, string.format("Landed %dm from %s", math.floor((focus - standPos).Magnitude), target.Name)
+end
+
+-- Float: hover over the entity and follow it for the whole run. You never touch the ground near it.
+-- Room above: upright, Float height over its head, leaning a few studs so the camera looks down at an angle.
+-- Low ceiling: lying flat face down between its head and the ceiling, camera pinned at your head.
+-- Noclip and no-touch stay on until the run ends.
+local function hoverPose(hover)
+	local box, size = boundsOf(hover.Target)
+	local center = box.Position
+	local top = center.Y + size.Y / 2
+	local hit = workspace:Raycast(
+		Vector3.new(center.X, top + 0.5, center.Z),
+		Vector3.new(0, hover.FloatHeight + hover.Height + 4, 0),
+		FloorRay
+	)
+	local room = hit and (hit.Position.Y - top) or math.huge
+	local dir = hover.Direction
+
+	if room >= hover.Height + HOLD.MinGap + 1 then
+		local gap = math.min(hover.FloatHeight, room - hover.Height - 1)
+		local lean = math.clamp(gap * 0.5, 2, 6)
+		local rootPos = Vector3.new(center.X, top + gap + hover.Lift, center.Z) + dir * lean
+		local head = rootPos + Vector3.new(0, 1.5, 0)
+		return CFrame.lookAt(rootPos, Vector3.new(center.X, rootPos.Y, center.Z)), head, center
+	end
+
+	local rootPos = Vector3.new(center.X, top + math.max(1.5, room / 2), center.Z)
+	local eye = rootPos + dir * 1.5
+	local ceiling = top + room
+	eye = Vector3.new(eye.X, math.clamp(eye.Y, top + 0.75, math.max(top + 0.75, ceiling - 0.5)), eye.Z)
+	return CFrame.lookAt(rootPos, rootPos - Vector3.yAxis, dir), eye, center
+end
+
+local function stepHover()
+	local hover = Bring.Hover
+	if not hover or not hover.Target:IsDescendantOf(workspace) then
+		return
+	end
+	local char, hum, root = getCharacter()
+	if not hum or not root or hum.Health <= 0 then
+		return
+	end
+	local ok, cf, eye = pcall(hoverPose, hover)
+	if not ok then
+		return
+	end
+	hover.Eye = eye
+	hum.PlatformStand = true
+	root.CFrame = cf
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	-- No-touch always. With Clear view on, your own body is hidden on your screen so it stays out of the shot.
+	for _, obj in ipairs(char:GetDescendants()) do
+		local isPart = obj:IsA("BasePart")
+		if isPart and obj.CanTouch then
+			obj.CanTouch = false
+			hover.Touch[obj] = true
+		end
+		if State.ClearView and (isPart or obj:IsA("Decal")) then
+			if hover.Hidden[obj] == nil then
+				hover.Hidden[obj] = obj.LocalTransparencyModifier
+			end
+			obj.LocalTransparencyModifier = 1
+		end
+	end
+end
+
+local function stopHover()
+	local hover = Bring.Hover
+	if not hover then
+		return
+	end
+	Bring.Hover = nil
+	for part in pairs(hover.Touch) do
+		if part.Parent then
+			part.CanTouch = true
+		end
+	end
+	for obj, value in pairs(hover.Hidden) do
+		if obj.Parent then
+			obj.LocalTransparencyModifier = value
+		end
+	end
+	if not State.Noclip then
+		onNoclip(false)
+	end
+	local _, hum, root = getCharacter()
+	if hum and not State.Fly then
+		hum.PlatformStand = hover.Stand
+	end
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end
+
+-- Starts the hover over the entity. Returns true, or false with a reason.
+local function floatAbove(target)
+	local targetRoot, reason = resolveTarget(target)
+	if not targetRoot then
+		return false, reason
+	end
+	local char, hum, root = getCharacter()
+	if not char or not hum or not root or hum.Health <= 0 then
+		return false, "Your character is not ready"
+	end
+
+	prepareSearch()
+	local base = flatUnit(-targetRoot.CFrame.LookVector) or Vector3.new(1, 0, 0)
+	local hover = {
+		Target = target,
+		FloatHeight = State.FloatHeight,
+		Height = math.clamp(char:GetExtentsSize().Y - 0.5, 3, 7),
+		Lift = rootHeight(hum, root) + 0.25,
+		Direction = base,
+		Stand = hum.PlatformStand,
+		Touch = {},
+		Hidden = {},
+		Eye = nil,
+	}
+	-- Pick the lean direction with a clear line from your head to the entity.
+	for _, angle in ipairs(TP_ANGLES) do
+		hover.Direction = CFrame.Angles(0, math.rad(angle), 0):VectorToWorldSpace(base)
+		local _, eye, center = hoverPose(hover)
+		if hasSight(eye, center) then
+			break
+		end
+		hover.Direction = base
+	end
+
+	Bring.Hover = hover
+	stepNoclip()
+	stepHover()
+	return true
 end
 
 local function onTeleportPressed()
-	if TeleportBusy then
+	if TeleportBusy or Bring.Running then
 		return
 	end
-	if not SelectedEntity then
+	local target = SelectedEntity
+	if not target then
 		notify("Pick an entity from the list")
 		return
 	end
 	TeleportBusy = true
-	local ok, err = pcall(teleportToEntity, SelectedEntity)
+	local ok, err = pcall(function()
+		releaseHeld()
+		local landed, message = landNear(target, State.TpDistance, false)
+		if landed then
+			task.spawn(function()
+				RunService.RenderStepped:Wait()
+				pcall(aimCamera, target)
+			end)
+		end
+		notify(message)
+	end)
 	TeleportBusy = false
 	if not ok then
 		warn("[Backrooms] " .. tostring(err))
@@ -1265,6 +1814,10 @@ local function onTeleportPressed()
 end
 
 local function onReturnPressed()
+	if Bring.Running then
+		Bring.Token += 1
+		return
+	end
 	if not ReturnCFrame then
 		notify("No saved spot yet")
 		return
@@ -1274,16 +1827,20 @@ local function onReturnPressed()
 		notify("Your character is not ready")
 		return
 	end
+	pcall(releaseHeld)
 	root.CFrame = ReturnCFrame
 	root.AssemblyLinearVelocity = Vector3.zero
 	ReturnCFrame = nil
 	notify("Back at your saved spot")
 end
 
-local startCamera = workspace.CurrentCamera
-local viewport = startCamera and startCamera.ViewportSize or Vector2.new(1280, 720)
-local WINDOW_WIDTH = math.min(340, viewport.X - 90)
-local WINDOW_HEIGHT = math.clamp(viewport.Y - 80, 250, 360)
+local WINDOW_WIDTH, WINDOW_HEIGHT
+do
+	local startCamera = workspace.CurrentCamera
+	local viewport = startCamera and startCamera.ViewportSize or Vector2.new(1280, 720)
+	WINDOW_WIDTH = math.min(340, viewport.X - 90)
+	WINDOW_HEIGHT = math.clamp(viewport.Y - 80, 250, 360)
+end
 local SIDEBAR_WIDTH = 96
 local TITLE_HEIGHT = 38
 local FOOTER_HEIGHT = 24
@@ -1368,46 +1925,54 @@ create("Frame", {
 	Parent = Window,
 })
 
-local LINK_TEXT = 'More: <font color="' .. LINK_COLOR .. '"><u>' .. DISCORD_INVITE .. "</u></font>"
-local COPIED_TEXT = '<font color="' .. LINK_COLOR .. '">copied!</font>'
+-- Footer locals live in a block so they do not count against the 200 local limit.
+do
+	local LINK_TEXT = 'More: <font color="' .. LINK_COLOR .. '"><u>' .. DISCORD_INVITE .. "</u></font>"
+	local COPIED_TEXT = '<font color="' .. LINK_COLOR .. '">copied!</font>'
 
-local Footer = create("TextButton", {
-	Name = "Footer",
-	AnchorPoint = Vector2.new(0, 1),
-	Position = UDim2.fromScale(0, 1),
-	Size = UDim2.new(1, 0, 0, FOOTER_HEIGHT),
-	BackgroundTransparency = 1,
-	AutoButtonColor = false,
-	RichText = true,
-	Text = LINK_TEXT,
-	TextColor3 = THEME.SubText,
-	Font = Enum.Font.Gotham,
-	TextSize = 11,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-	Parent = Window,
-})
+	local Footer = create("TextButton", {
+		Name = "Footer",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.fromScale(0, 1),
+		Size = UDim2.new(1, 0, 0, FOOTER_HEIGHT),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		RichText = true,
+		Text = LINK_TEXT,
+		TextColor3 = THEME.SubText,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = Window,
+	})
 
-local footerId = 0
-Footer.MouseButton1Click:Connect(function()
-	local copied = false
-	if setClipboard then
-		copied = pcall(setClipboard, DISCORD_INVITE)
-	end
-	footerId += 1
-	local id = footerId
-	Footer.Text = copied and COPIED_TEXT or "copy failed"
-	task.delay(2, function()
-		if id == footerId and Footer.Parent then
-			Footer.Text = LINK_TEXT
+	local footerId = 0
+	Footer.MouseButton1Click:Connect(function()
+		local copied = false
+		if setClipboard then
+			copied = pcall(setClipboard, DISCORD_INVITE)
 		end
+		footerId += 1
+		local id = footerId
+		Footer.Text = copied and COPIED_TEXT or "copy failed"
+		task.delay(2, function()
+			if id == footerId and Footer.Parent then
+				Footer.Text = LINK_TEXT
+			end
+		end)
 	end)
-end)
+end
 
-local Sidebar = create("Frame", {
+-- Scrolls when the tabs outgrow a short screen.
+local Sidebar = create("ScrollingFrame", {
 	Name = "Sidebar",
 	Position = UDim2.fromOffset(0, BODY_TOP),
 	Size = UDim2.new(0, SIDEBAR_WIDTH, 1, BODY_HEIGHT),
 	BackgroundTransparency = 1,
+	ScrollBarThickness = 0,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
 	Parent = Window,
 })
 pad(Sidebar, 8, 8, 8, 8)
@@ -1469,15 +2034,22 @@ local function makeTab(name, scrolling)
 	corner(indicator, 2)
 
 	local label = create("TextLabel", {
-		Position = UDim2.fromOffset(12, 0),
-		Size = UDim2.new(1, -12, 1, 0),
+		Position = UDim2.fromOffset(12, 2),
+		Size = UDim2.new(1, -16, 1, -4),
 		BackgroundTransparency = 1,
 		Text = name,
 		TextColor3 = THEME.SubText,
 		Font = Enum.Font.GothamMedium,
-		TextSize = 12,
+		TextScaled = true,
+		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = button,
+	})
+	-- Long tab names wrap and shrink to fit the sidebar.
+	create("UITextSizeConstraint", {
+		MaxTextSize = 12,
+		MinTextSize = 8,
+		Parent = label,
 	})
 
 	local page
@@ -1803,7 +2375,7 @@ local function addButton(tab, text, style)
 	return button
 end
 
-local function addButtonPair(tab, leftText, rightText)
+local function addButtonRow(tab, specs)
 	tab.Order += 1
 	local row = create("Frame", {
 		Size = UDim2.new(1, 0, 0, 34),
@@ -1811,12 +2383,16 @@ local function addButtonPair(tab, leftText, rightText)
 		LayoutOrder = tab.Order,
 		Parent = tab.Page,
 	})
-	local left = styledButton("accent", leftText, row)
-	left.Size = UDim2.new(0.5, -3, 1, 0)
-	local right = styledButton("plain", rightText, row)
-	right.Size = UDim2.new(0.5, -3, 1, 0)
-	right.Position = UDim2.new(0.5, 3, 0, 0)
-	return left, right
+	local count = #specs
+	local gap = 6
+	local buttons = {}
+	for index, spec in ipairs(specs) do
+		local button = styledButton(spec[2], spec[1], row)
+		button.Size = UDim2.new(1 / count, -gap * (count - 1) / count, 1, 0)
+		button.Position = UDim2.new((index - 1) / count, gap * (index - 1) / count, 0, 0)
+		buttons[index] = button
+	end
+	return table.unpack(buttons)
 end
 
 local VisualsTab = makeTab("Visuals", true)
@@ -1838,6 +2414,14 @@ addSection(MovementTab, "Flight")
 addToggle(MovementTab, "Fly", "Fly", onFly)
 addSlider(MovementTab, "Fly speed", "FlySpeed", "")
 addToggle(MovementTab, "Noclip", "Noclip", onNoclip)
+addSection(MovementTab, "Teleport")
+addSlider(MovementTab, "Teleport distance", "TpDistance", "m")
+addSection(MovementTab, "Auto picture")
+addToggle(MovementTab, "Auto shutter", "AutoShot")
+addToggle(MovementTab, "Clear view", "ClearView")
+addSlider(MovementTab, "Float height", "FloatHeight", "m")
+addSlider(MovementTab, "Photo window", "PhotoWindow", "s")
+addToggle(MovementTab, "Pull to camera", "PullToCamera")
 
 local EspTab = makeTab("ESP", true)
 addSection(EspTab, "Highlights")
@@ -1848,9 +2432,12 @@ addSection(EspTab, "Warning")
 addToggle(EspTab, "Entity Alert", "EntityAlert", updateAlert)
 addSlider(EspTab, "Alert range", "AlertRange", "m")
 
-local EntitiesTab = makeTab("Entities", false)
-addSlider(EntitiesTab, "Teleport distance", "TpDistance", "m")
-local TeleportButton, ReturnButton = addButtonPair(EntitiesTab, "Teleport", "Return")
+local EntitiesTab = makeTab("(NEW) entity achievements", false)
+local PictureButton = addButton(EntitiesTab, "Auto take picture", "accent")
+local TeleportButton, ReturnButton = addButtonRow(EntitiesTab, {
+	{ "Teleport", "plain" },
+	{ "Return", "plain" },
+})
 TeleportButton.MouseButton1Click:Connect(onTeleportPressed)
 ReturnButton.MouseButton1Click:Connect(onReturnPressed)
 
@@ -1870,7 +2457,7 @@ local EntityCount = create("TextLabel", {
 
 EntitiesTab.Order += 1
 local EntityList = create("ScrollingFrame", {
-	Size = UDim2.new(1, 0, 1, -118),
+	Size = UDim2.new(1, 0, 1, -102),
 	BackgroundTransparency = 1,
 	ScrollBarThickness = 2,
 	ScrollBarImageColor3 = THEME.Stroke,
@@ -1896,6 +2483,611 @@ local EntityEmpty = create("TextLabel", {
 	LayoutOrder = -1,
 	Parent = EntityList,
 })
+
+Pumpkin.Tab = makeTab("(NEW) Halloween 2026", false)
+Pumpkin.Button = addButton(Pumpkin.Tab, "Auto take pictures", "accent")
+addToggle(Pumpkin.Tab, "Green pumpkin ESP", "PumpkinESP", syncESP)
+
+Pumpkin.Tab.Order += 1
+Pumpkin.Count = create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	BackgroundTransparency = 1,
+	Text = "GREEN PUMPKINS (0)",
+	TextColor3 = THEME.SubText,
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Bottom,
+	LayoutOrder = Pumpkin.Tab.Order,
+	Parent = Pumpkin.Tab.Page,
+})
+
+Pumpkin.Tab.Order += 1
+Pumpkin.List = create("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -104),
+	BackgroundTransparency = 1,
+	ScrollBarThickness = 2,
+	ScrollBarImageColor3 = THEME.Stroke,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	LayoutOrder = Pumpkin.Tab.Order,
+	Parent = Pumpkin.Tab.Page,
+})
+create("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = Pumpkin.List,
+})
+
+Pumpkin.Empty = create("TextLabel", {
+	Size = UDim2.new(1, -4, 0, 34),
+	BackgroundTransparency = 1,
+	Text = "No pumpkins loaded yet",
+	TextColor3 = THEME.SubText,
+	Font = Enum.Font.Gotham,
+	TextSize = 12,
+	LayoutOrder = -1,
+	Parent = Pumpkin.List,
+})
+
+-- Server hop finder: hops public servers of this game until the chosen entity shows up.
+-- Before each hop the script queues itself with queue_on_teleport, so it starts on its own
+-- in the next server and keeps looking. The hunt is also saved to a file, so an autoexec copy
+-- of the script picks it up too.
+local Hunt = {
+	ScriptUrl = "https://raw.githubusercontent.com/playertatrer-bot/Sandbox-Public/main/ul.lua",
+	StateFile = "Backrooms_hunt.json",
+	KnownFile = "Backrooms_entities.json",
+	ScanTime = 12, -- seconds to look around each server before hopping on
+	Fresh = 180, -- seconds a saved hunt stays resumable, so an old one never restarts by surprise
+	State = nil, -- { Target, Match, Loose, Key, Id, Active, Visited = { job ids }, Hops, Updated }
+	Known = {}, -- every entity name seen in any server, saved to KnownFile
+	Rows = {},
+	Busy = false, -- a hop is in progress
+	Failed = false, -- the last teleport failed
+	Queued = false, -- this server already queued the script for the next one
+	AliasMap = {}, -- normalized name -> wiki name, built from Seeds
+
+	-- Every entity on the Unseen Liminality wiki: 15 in the game, then the upcoming
+	-- and private server ones. Seen is the model name your game uses, from your clip.
+	-- Also holds other likely model names. Names learned in new servers get added on top.
+	Seeds = {
+		{ Name = "Archibald Leland Sutter Still Life", Seen = "LampMan", Also = { "Archibald", "LampStillLife" } },
+		{ Name = "The Misremembered", Seen = "Misremembered", Also = {} },
+		{ Name = "The Misprint", Also = { "Misprint", "MisPaint" } },
+		{ Name = "Still Life", Seen = "StillLife", Also = {} },
+		{ Name = "The Caroler", Also = { "Caroler", "Carolers" } },
+		{ Name = "The Mimic", Also = { "Mimic", "FakePlayer" } },
+		{ Name = "Cap'n Clark", Seen = "Pirate", Also = { "CapnClark", "CaptainClark", "TheCaptain" } },
+		{ Name = "The Bellhop", Also = { "Bellhop" } },
+		{ Name = "Headhunter", Also = {} },
+		{ Name = "The Rolling Giant", Also = { "RollingGiant" } },
+		{ Name = "SpongeBob Balloon", Seen = "Bob", Also = { "SpongeBob", "SpongeBobBalloon" } },
+		{ Name = "Die Dice", Also = { "DieDice" } },
+		{ Name = "Looker", Also = {} },
+		{ Name = "The Following Chair", Also = { "FollowingChair" } },
+		{ Name = "The Moving Mannequins", Also = { "Mannequin", "Mannequins", "MovingMannequin", "MovingMannequins" } },
+		{ Name = "Furniture Crabs", Also = { "FurnitureCrab" } },
+		{ Name = "Captain Huss", Also = { "CaptainHuss", "Huss" } },
+		{ Name = "Evil SpongeBob Balloon", Also = { "EvilBob", "EvilSpongeBob" } },
+		{ Name = "Gubbys", Also = { "Gubby" } },
+	},
+}
+
+Hunt.Tab = makeTab("(NEW) Server hop finder", false)
+Hunt.Button = addButton(Hunt.Tab, "Server hop to find", "accent")
+
+Hunt.Tab.Order += 1
+Hunt.Box = create("TextBox", {
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundColor3 = THEME.Surface,
+	ClearTextOnFocus = false,
+	PlaceholderText = "Type an entity or pick one below",
+	PlaceholderColor3 = THEME.SubText,
+	Text = "",
+	TextColor3 = THEME.Text,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	LayoutOrder = Hunt.Tab.Order,
+	Parent = Hunt.Tab.Page,
+})
+corner(Hunt.Box, 8)
+pad(Hunt.Box, 12, 12, 0, 0)
+
+Hunt.Tab.Order += 1
+Hunt.Count = create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	BackgroundTransparency = 1,
+	Text = "KNOWN ENTITIES (0)",
+	TextColor3 = THEME.SubText,
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Bottom,
+	LayoutOrder = Hunt.Tab.Order,
+	Parent = Hunt.Tab.Page,
+})
+
+Hunt.Tab.Order += 1
+Hunt.List = create("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -102),
+	BackgroundTransparency = 1,
+	ScrollBarThickness = 2,
+	ScrollBarImageColor3 = THEME.Stroke,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	LayoutOrder = Hunt.Tab.Order,
+	Parent = Hunt.Tab.Page,
+})
+create("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = Hunt.List,
+})
+
+Hunt.Empty = create("TextLabel", {
+	Size = UDim2.new(1, -4, 0, 34),
+	BackgroundTransparency = 1,
+	Text = "No entities seen yet",
+	TextColor3 = THEME.SubText,
+	Font = Enum.Font.Gotham,
+	TextSize = 12,
+	LayoutOrder = -1,
+	Parent = Hunt.List,
+})
+
+-- Names match without case, spaces or symbols, so "Lamp Man" finds "LampMan" and "capn clark" finds "Cap'n Clark".
+function Hunt.norm(name)
+	return string.lower((string.gsub(name, "[^%w]", "")))
+end
+
+for _, seed in ipairs(Hunt.Seeds) do
+	local key = Hunt.norm(seed.Name)
+	Hunt.AliasMap[key] = seed.Name
+	Hunt.AliasMap[(string.gsub(key, "^the", ""))] = seed.Name
+	if seed.Seen then
+		Hunt.AliasMap[Hunt.norm(seed.Seen)] = seed.Name
+	end
+	for _, alias in ipairs(seed.Also) do
+		Hunt.AliasMap[Hunt.norm(alias)] = seed.Name
+	end
+end
+
+-- Every normalized name that counts as the target. Wiki names bring all their aliases.
+-- A typed name that is not on the wiki list matches loosely, by containment.
+function Hunt.matchSet(target)
+	local key = Hunt.norm(target)
+	local owner = Hunt.AliasMap[key]
+	if not owner then
+		return { [key] = true }, true
+	end
+	local set = {}
+	for alias, name in pairs(Hunt.AliasMap) do
+		if name == owner then
+			set[alias] = true
+		end
+	end
+	return set, false
+end
+
+function Hunt.read(path)
+	if not FileAccess then
+		return nil
+	end
+	local ok, data = pcall(function()
+		if isfile(path) then
+			return HttpService:JSONDecode(readfile(path))
+		end
+		return nil
+	end)
+	return ok and data or nil
+end
+
+function Hunt.write(path, data)
+	if FileAccess then
+		pcall(function()
+			writefile(path, HttpService:JSONEncode(data))
+		end)
+	end
+end
+
+for _, name in ipairs(Hunt.read(Hunt.KnownFile) or {}) do
+	if type(name) == "string" then
+		Hunt.Known[name] = true
+	end
+end
+
+-- Remembers every entity name seen, so the list grows with each server you visit.
+function Hunt.learn()
+	local added = false
+	for obj in pairs(Entities) do
+		if obj:IsDescendantOf(workspace) and not isPlayerCharacter(obj) and not Hunt.Known[obj.Name] then
+			Hunt.Known[obj.Name] = true
+			added = true
+		end
+	end
+	if added then
+		local names = {}
+		for name in pairs(Hunt.Known) do
+			table.insert(names, name)
+		end
+		Hunt.write(Hunt.KnownFile, names)
+	end
+end
+
+-- The hunted entity in this server, or nil. deep also checks every model in the map by name.
+function Hunt.findHere(state, deep)
+	local function fits(name)
+		local key = Hunt.norm(name)
+		if state.Match[key] then
+			return true
+		end
+		return state.Loose and #state.Key >= 4 and string.find(key, state.Key, 1, true) ~= nil
+	end
+	for obj in pairs(Entities) do
+		if obj:IsDescendantOf(workspace) and not isPlayerCharacter(obj) and fits(obj.Name) then
+			return obj
+		end
+	end
+	if deep then
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			if obj:IsA("Model") and fits(obj.Name) and not isPlayerCharacter(obj) then
+				return obj
+			end
+		end
+	end
+	return nil
+end
+
+function Hunt.paint()
+	local active = Hunt.State ~= nil and Hunt.State.Active
+	local colors = BUTTON_STYLES[active and "danger" or "accent"]
+	Hunt.Button.Text = active and "Stop finding" or "Server hop to find"
+	Hunt.Button.BackgroundColor3 = colors[1]
+	Hunt.Button.TextColor3 = colors[2]
+end
+
+function Hunt.save()
+	local state = Hunt.State
+	if state then
+		state.Updated = os.time()
+		Hunt.write(Hunt.StateFile, state)
+	end
+end
+
+function Hunt.stop(message)
+	if Hunt.State then
+		Hunt.State.Active = false
+		Hunt.save()
+	end
+	Hunt.State = nil
+	GlobalEnv.BackroomsHunt = nil
+	Hunt.paint()
+	if message then
+		notify(message)
+	end
+end
+
+-- Picks a random public server of this place that has room and was not visited yet.
+-- Fails with "error" when the server list does not load, or "full" when every server was visited.
+function Hunt.pickServer()
+	local visited = { [game.JobId] = true }
+	for _, id in ipairs(Hunt.State.Visited) do
+		visited[id] = true
+	end
+	local cursor = nil
+	for _ = 1, 5 do
+		local url = string.format(
+			"https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100%s",
+			game.PlaceId,
+			cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+		)
+		local fetched, page = pcall(function()
+			return HttpService:JSONDecode(game:HttpGet(url))
+		end)
+		if not fetched or type(page) ~= "table" or type(page.data) ~= "table" then
+			return nil, "error"
+		end
+		local open = {}
+		for _, server in ipairs(page.data) do
+			if type(server) == "table" and type(server.id) == "string" and not visited[server.id]
+				and (tonumber(server.playing) or 0) < (tonumber(server.maxPlayers) or 0)
+			then
+				table.insert(open, server.id)
+			end
+		end
+		if #open > 0 then
+			return open[math.random(1, #open)]
+		end
+		if type(page.nextPageCursor) ~= "string" then
+			break
+		end
+		cursor = page.nextPageCursor
+	end
+	return nil, "full"
+end
+
+-- Queues the script for the next server, then teleports. It never gives up on its own:
+-- a busy server list gets retried, a failed teleport moves to another server, and once
+-- every server was checked it starts over. Only Stop finding ends it.
+function Hunt.hop()
+	local state = Hunt.State
+	if not state or not state.Active or Hunt.Busy then
+		return
+	end
+	Hunt.Busy = true
+	table.insert(state.Visited, game.JobId)
+	while #state.Visited > 300 do
+		table.remove(state.Visited, 1)
+	end
+
+	local failures = 0
+	while Hunt.State == state and state.Active and Running do
+		local serverId, reason = Hunt.pickServer()
+		if not serverId then
+			failures += 1
+			if reason == "full" then
+				notify("Checked every server, starting over", true, THEME.Accent)
+				table.clear(state.Visited)
+				table.insert(state.Visited, game.JobId)
+			else
+				notify("Server list busy, retrying", true, THEME.Accent)
+			end
+			task.wait(math.min(3 + failures * 2, 15))
+		else
+			state.Hops += 1
+			Hunt.save()
+
+			if not Hunt.Queued then
+				local queue = queue_on_teleport or queueonteleport
+					or (syn and syn.queue_on_teleport)
+					or (fluxus and fluxus.queue_on_teleport)
+				if typeof(queue) == "function" then
+					local code = string.format(
+						'getgenv().BackroomsHunt = game:GetService("HttpService"):JSONDecode([==[%s]==])\nloadstring(game:HttpGet("%s"))()',
+						HttpService:JSONEncode(state),
+						Hunt.ScriptUrl
+					)
+					Hunt.Queued = pcall(queue, code)
+				end
+				if not Hunt.Queued then
+					notify("No queue_on_teleport here, add the script to autoexec", true, THEME.Danger)
+					task.wait(3)
+				end
+			end
+
+			Hunt.Failed = false
+			local sent = pcall(function()
+				game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, serverId, LocalPlayer)
+			end)
+			table.insert(state.Visited, serverId)
+			local waited = 0
+			while sent and waited < 20 and not Hunt.Failed and Hunt.State == state and state.Active and Running do
+				task.wait(0.5)
+				waited += 0.5
+			end
+			if Hunt.State == state and state.Active and Running then
+				failures += 1
+				notify("Teleport failed, trying another server", true, THEME.Accent)
+				task.wait(math.min(2 + failures, 10))
+			end
+		end
+	end
+	Hunt.Busy = false
+end
+
+track(game:GetService("TeleportService").TeleportInitFailed:Connect(function(player)
+	if player == LocalPlayer then
+		Hunt.Failed = true
+	end
+end))
+
+-- Looks around this server for ScanTime seconds, then hops on if the entity is not here.
+function Hunt.run()
+	local state = Hunt.State
+	if not state or not state.Active then
+		return
+	end
+	Hunt.paint()
+	notify("Finding " .. state.Target, true, THEME.Accent)
+
+	local started = os.clock()
+	local nextDeep = started + 3
+	local found = nil
+	while Running and Hunt.State == state and state.Active and os.clock() - started < Hunt.ScanTime do
+		local deep = os.clock() >= nextDeep
+		if deep then
+			nextDeep = os.clock() + 4
+		end
+		found = Hunt.findHere(state, deep)
+		if found then
+			break
+		end
+		task.wait(0.5)
+	end
+	if not Running or Hunt.State ~= state or not state.Active then
+		return
+	end
+
+	if found then
+		addEntity(found, "named")
+		SelectedEntity = found
+		if not State.EntityESP then
+			setToggle("EntityESP", true)
+		end
+		Hunt.stop(nil)
+		notify("FOUND!", true, THEME.Accent)
+		return
+	end
+	notify("Not found, server hopping", true, THEME.Accent)
+	task.wait(1)
+	Hunt.hop()
+end
+
+function Hunt.start()
+	local target = string.match(Hunt.Box.Text, "^%s*(.-)%s*$") or ""
+	if target == "" then
+		notify("Pick or type an entity first")
+		return
+	end
+	local match, loose = Hunt.matchSet(target)
+	Hunt.State = {
+		Target = Hunt.AliasMap[Hunt.norm(target)] or target,
+		Match = match,
+		Loose = loose,
+		Key = Hunt.norm(target),
+		Id = HttpService:GenerateGUID(false),
+		Active = true,
+		Visited = {},
+		Hops = 0,
+	}
+	Hunt.save()
+	task.spawn(Hunt.run)
+end
+
+-- Runs on load. Picks up a hunt carried over from the last server.
+-- The saved file wins when it exists, since it holds the latest list of visited servers.
+function Hunt.resume()
+	local carried = GlobalEnv.BackroomsHunt
+	GlobalEnv.BackroomsHunt = nil
+	local saved = Hunt.read(Hunt.StateFile)
+	local fresh = type(saved) == "table" and saved.Active == true
+		and type(saved.Updated) == "number" and os.time() - saved.Updated <= Hunt.Fresh
+	local state = nil
+	if fresh and (type(carried) ~= "table" or carried.Id == saved.Id) then
+		state = saved
+	elseif type(saved) ~= "table" and type(carried) == "table" and carried.Active == true then
+		state = carried
+	end
+	if not state or type(state.Target) ~= "string" then
+		return
+	end
+	state.Visited = type(state.Visited) == "table" and state.Visited or {}
+	state.Hops = tonumber(state.Hops) or 0
+	if type(state.Match) ~= "table" or next(state.Match) == nil then
+		state.Match, state.Loose = Hunt.matchSet(state.Target)
+	end
+	state.Key = type(state.Key) == "string" and state.Key or Hunt.norm(state.Target)
+	Hunt.State = state
+	Hunt.Box.Text = state.Target
+	-- Starts looking right away. The scan does not need your character, and entities
+	-- that load in during the scan still count.
+	Hunt.run()
+end
+
+function Hunt.refresh()
+	if Tabs[ActiveTab] ~= Hunt.Tab or not Window.Visible then
+		return
+	end
+	-- Entities loaded in this server, by wiki name when one matches.
+	local here = {}
+	local origin = myPosition()
+	for obj in pairs(Entities) do
+		if obj:IsDescendantOf(workspace) and not isPlayerCharacter(obj) then
+			local name = Hunt.AliasMap[Hunt.norm(obj.Name)] or obj.Name
+			local root = getRoot(obj)
+			local dist = root and (rootPosition(root) - origin).Magnitude or math.huge
+			if not here[name] or dist < here[name] then
+				here[name] = dist
+			end
+		end
+	end
+
+	-- Every wiki entity, plus learned names that match none of them. Ones in this server go first.
+	local names, listed, labels = {}, {}, {}
+	for _, seed in ipairs(Hunt.Seeds) do
+		listed[seed.Name] = true
+		table.insert(names, seed.Name)
+		if seed.Seen and Hunt.norm(seed.Seen) ~= Hunt.norm(seed.Name) then
+			labels[seed.Name] = seed.Name .. " (" .. seed.Seen .. ")"
+		end
+	end
+	for name in pairs(Hunt.Known) do
+		local display = Hunt.AliasMap[Hunt.norm(name)] or name
+		if not listed[display] then
+			listed[display] = true
+			table.insert(names, display)
+		end
+	end
+	table.sort(names, function(a, b)
+		local da, db = here[a], here[b]
+		if da and db then
+			return da < db
+		end
+		if da or db then
+			return da ~= nil
+		end
+		return string.lower(a) < string.lower(b)
+	end)
+
+	local chosenKey = Hunt.norm(Hunt.Box.Text)
+	local chosen = Hunt.AliasMap[chosenKey]
+	for index, name in ipairs(names) do
+		local row = Hunt.Rows[name]
+		if not row then
+			local button = create("TextButton", {
+				Size = UDim2.new(1, -4, 0, 34),
+				BackgroundColor3 = THEME.Surface,
+				AutoButtonColor = false,
+				Text = "",
+				Parent = Hunt.List,
+			})
+			corner(button, 8)
+			local outline = stroke(button, THEME.Accent, 0, 1.5)
+			local label = create("TextLabel", {
+				Position = UDim2.fromOffset(12, 0),
+				Size = UDim2.new(1, -84, 1, 0),
+				BackgroundTransparency = 1,
+				Text = labels[name] or name,
+				TextColor3 = THEME.Text,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = button,
+			})
+			local status = create("TextLabel", {
+				AnchorPoint = Vector2.new(1, 0),
+				Position = UDim2.new(1, -12, 0, 0),
+				Size = UDim2.new(0, 64, 1, 0),
+				BackgroundTransparency = 1,
+				Text = "",
+				TextColor3 = THEME.SubText,
+				Font = Enum.Font.Gotham,
+				TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = button,
+			})
+			button.MouseButton1Click:Connect(function()
+				Hunt.Box.Text = name
+				Hunt.refresh()
+			end)
+			row = { Button = button, Outline = outline, Label = label, Status = status }
+			Hunt.Rows[name] = row
+		end
+		local picked = (chosen ~= nil and chosen == name) or Hunt.norm(name) == chosenKey
+		row.Button.LayoutOrder = index
+		row.Outline.Enabled = picked
+		row.Label.TextColor3 = picked and THEME.Accent or THEME.Text
+		local dist = here[name]
+		row.Status.Text = dist and string.format("here %dm", math.floor(dist)) or ""
+	end
+	Hunt.Empty.Visible = #names == 0
+	Hunt.Count.Text = string.format("ENTITIES (%d)", #names)
+end
+
+Hunt.Tab.OnOpen = Hunt.refresh
+
+Hunt.Button.MouseButton1Click:Connect(function()
+	if Hunt.State and Hunt.State.Active then
+		Hunt.stop("Stopped finding")
+	else
+		Hunt.start()
+	end
+end)
 
 local MiscTab = makeTab("Misc", true)
 addSection(MiscTab, "Utility")
@@ -1973,7 +3165,7 @@ local function makeEntityRow(entity)
 end
 
 local function refreshEntityList()
-	if ActiveTab ~= "Entities" or not Window.Visible then
+	if Tabs[ActiveTab] ~= EntitiesTab or not Window.Visible then
 		return
 	end
 
@@ -2000,7 +3192,9 @@ local function refreshEntityList()
 		local row = EntityRows[ent] or makeEntityRow(ent)
 		row.Button.LayoutOrder = index
 		row.Name.Text = ent.Name
-		row.Dist.Text = string.format("%dm", math.floor(entry.Distance))
+		local holding = Bring.Held and Bring.Held.Entity == ent
+		row.Dist.Text = holding and (Bring.Held.Mode == "lock" and "locked" or "held")
+			or string.format("%dm", math.floor(entry.Distance))
 	end
 	for ent, row in pairs(EntityRows) do
 		if not seen[ent] then
@@ -2018,6 +3212,624 @@ local function refreshEntityList()
 end
 
 EntitiesTab.OnOpen = refreshEntityList
+
+-- Returns loaded pumpkins nearest first, and true when they are confirmed green.
+-- Each entry is the smallest pumpkin-sized object, so a container model holding many
+-- pumpkins never counts as one giant pumpkin in the middle of the map.
+-- With no confirmed green ones it returns every pumpkin so the run still has targets.
+local function collectPumpkins()
+	local MAX_SIZE = 25 -- studs. Anything bigger is a container, not a pumpkin.
+
+	local function greenish(color)
+		return color.G > color.R + 0.12 and color.G > color.B + 0.12
+	end
+
+	-- Green check: names and attributes up to 3 levels up, green lights or highlights,
+	-- green mesh tint, then the color of the biggest part.
+	local function isGreen(obj)
+		local node, depth = obj, 0
+		while node and node ~= workspace and depth < 4 do
+			if string.find(string.lower(node.Name), "green", 1, true) then
+				return true
+			end
+			for key, value in pairs(node:GetAttributes()) do
+				local attr = string.lower(key) .. " " .. (type(value) == "string" and string.lower(value) or "")
+				if string.find(attr, "green", 1, true) then
+					return true
+				end
+			end
+			node = node.Parent
+			depth += 1
+		end
+		local best, bestSize = nil, 0
+		local parts = obj:GetDescendants()
+		if obj:IsA("BasePart") then
+			table.insert(parts, obj)
+		end
+		for _, child in ipairs(parts) do
+			if child:IsA("Light") then
+				if greenish(child.Color) then
+					return true
+				end
+			elseif child:IsA("Highlight") then
+				if greenish(child.FillColor) or greenish(child.OutlineColor) then
+					return true
+				end
+			elseif child:IsA("SpecialMesh") then
+				local tint = child.VertexColor
+				if tint.Y > tint.X + 0.12 and tint.Y > tint.Z + 0.12 then
+					return true
+				end
+			elseif child:IsA("BasePart") and child.Size.Magnitude > bestSize then
+				best, bestSize = child, child.Size.Magnitude
+			end
+		end
+		return best ~= nil and greenish(best.Color)
+	end
+
+	-- Display name: the closest name with "pumpkin" in it, preferring one that also says "green".
+	local function labelOf(obj)
+		local node, depth, named = obj, 0, nil
+		while node and node ~= workspace and depth < 4 do
+			local lowered = string.lower(node.Name)
+			if string.find(lowered, "pumpkin", 1, true) then
+				if string.find(lowered, "green", 1, true) then
+					return node.Name
+				end
+				named = named or node.Name
+			end
+			node = node.Parent
+			depth += 1
+		end
+		return named or obj.Name
+	end
+
+	local function sizeOf(obj)
+		local _, size = boundsOf(obj)
+		return math.max(size.X, size.Y, size.Z)
+	end
+
+	local CollectionService = game:GetService("CollectionService")
+	local taggedGreen = {}
+	local ok, tags = pcall(function()
+		return CollectionService:GetAllTags()
+	end)
+	if ok then
+		for _, tag in ipairs(tags) do
+			local lowered = string.lower(tag)
+			if string.find(lowered, "pumpkin", 1, true) then
+				for _, obj in ipairs(CollectionService:GetTagged(tag)) do
+					if obj:IsA("Model") or obj:IsA("BasePart") then
+						Pumpkin.Found[obj] = true
+						if string.find(lowered, "green", 1, true) then
+							taggedGreen[obj] = true
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- Pumpkins a player is carrying do not count.
+	local function carried(obj)
+		local node = obj.Parent
+		while node and node ~= workspace do
+			if node:IsA("Tool") or Players:GetPlayerFromCharacter(node) then
+				return true
+			end
+			node = node.Parent
+		end
+		return false
+	end
+
+	local named = {}
+	for obj in pairs(Pumpkin.Found) do
+		if not obj:IsDescendantOf(workspace) then
+			Pumpkin.Found[obj] = nil
+		elseif not carried(obj) then
+			named[obj] = true
+		end
+	end
+
+	local function holdsNamed(obj)
+		for other in pairs(named) do
+			if other ~= obj and other:IsDescendantOf(obj) then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Pumpkin-sized named objects count. A big one with no named pumpkins inside
+	-- stands for its pumpkin-sized children instead.
+	local candidates = {}
+	for obj in pairs(named) do
+		if sizeOf(obj) <= MAX_SIZE then
+			candidates[obj] = true
+		elseif not holdsNamed(obj) then
+			for _, child in ipairs(obj:GetChildren()) do
+				if (child:IsA("Model") or child:IsA("BasePart")) and sizeOf(child) <= MAX_SIZE then
+					candidates[child] = true
+				end
+			end
+		end
+	end
+
+	-- A candidate holding another candidate is a wrapper. The one inside is the pumpkin.
+	local wrappers = {}
+	for obj in pairs(candidates) do
+		local node = obj.Parent
+		while node and node ~= workspace do
+			if candidates[node] then
+				wrappers[node] = true
+			end
+			node = node.Parent
+		end
+	end
+
+	local origin = myPosition()
+	local green, all = {}, {}
+	for obj in pairs(candidates) do
+		local root = not wrappers[obj] and getRoot(obj)
+		if root and root:IsA("BasePart") then
+			local entry = {
+				Target = obj,
+				Label = labelOf(obj),
+				Distance = (root.Position - origin).Magnitude,
+			}
+			table.insert(all, entry)
+			if taggedGreen[obj] or isGreen(obj) then
+				table.insert(green, entry)
+			end
+		end
+	end
+	local list = #green > 0 and green or all
+	table.sort(list, function(a, b)
+		return a.Distance < b.Distance
+	end)
+	return list, #green > 0
+end
+
+local function refreshPumpkinList()
+	if Tabs[ActiveTab] ~= Pumpkin.Tab or not Window.Visible then
+		return
+	end
+	local list, confirmed = Pumpkin.Targets or {}, Pumpkin.Confirmed
+	local seen = {}
+	local done = 0
+	for index, entry in ipairs(list) do
+		local obj = entry.Target
+		seen[obj] = true
+		local row = Pumpkin.Rows[obj]
+		if not row then
+			local frame = create("Frame", {
+				Size = UDim2.new(1, -4, 0, 34),
+				BackgroundColor3 = THEME.Surface,
+				Parent = Pumpkin.List,
+			})
+			corner(frame, 8)
+			create("TextLabel", {
+				Position = UDim2.fromOffset(12, 0),
+				Size = UDim2.new(1, -84, 1, 0),
+				BackgroundTransparency = 1,
+				Text = entry.Label,
+				TextColor3 = THEME.Text,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = frame,
+			})
+			local status = create("TextLabel", {
+				AnchorPoint = Vector2.new(1, 0),
+				Position = UDim2.new(1, -12, 0, 0),
+				Size = UDim2.new(0, 64, 1, 0),
+				BackgroundTransparency = 1,
+				Text = "",
+				TextColor3 = THEME.SubText,
+				Font = Enum.Font.Gotham,
+				TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Parent = frame,
+			})
+			row = { Frame = frame, Status = status }
+			Pumpkin.Rows[obj] = row
+		end
+		local isDone = Pumpkin.Done[obj] == true
+		if isDone then
+			done += 1
+		end
+		row.Frame.LayoutOrder = index
+		row.Status.Text = isDone and "done" or string.format("%dm", math.floor(entry.Distance))
+		row.Status.TextColor3 = isDone and THEME.Accent or THEME.SubText
+	end
+	for obj, row in pairs(Pumpkin.Rows) do
+		if not seen[obj] then
+			row.Frame:Destroy()
+			Pumpkin.Rows[obj] = nil
+		end
+	end
+	Pumpkin.Empty.Visible = #list == 0
+	Pumpkin.Count.Text = string.format("%s (%d)   DONE %d", confirmed and "GREEN PUMPKINS" or "PUMPKINS", #list, done)
+end
+
+Pumpkin.Tab.OnOpen = refreshPumpkinList
+
+-- One picture of one target: get close, lock on, shoot until the picture is confirmed, clean up.
+-- near lands you on the floor next to it (pumpkins). Otherwise you float above it (entities).
+-- Returns whether a picture was confirmed, a message when something went wrong, and whether the whole run should stop.
+local function shootTarget(target, token, near)
+	local function findCamera(holder)
+		if not holder then
+			return nil
+		end
+		for _, child in ipairs(holder:GetChildren()) do
+			if child:IsA("Tool") then
+				local name = string.lower(child.Name)
+				for _, word in ipairs(HOLD.CameraWords) do
+					if string.find(name, word, 1, true) then
+						return child
+					end
+				end
+			end
+		end
+		return nil
+	end
+
+	-- Equips the camera tool if needed. Returns it only when it is ready to shoot.
+	local function cameraReady()
+		local char, hum = getCharacter()
+		if not char or not hum then
+			return nil
+		end
+		local tool = findCamera(char)
+		if not tool then
+			tool = findCamera(LocalPlayer:FindFirstChildOfClass("Backpack"))
+			if not tool then
+				return nil
+			end
+			hum:EquipTool(tool)
+			task.wait(0.35)
+		end
+		if not tool.Enabled then
+			return nil -- still reloading
+		end
+		return tool
+	end
+
+	local watchers = {}
+	local shot = false
+	local message = nil
+	local stop = false
+
+	local ok, err = pcall(function()
+		if releaseHeld() then
+			task.wait(0.15)
+		end
+
+		local moved, reason
+		if near then
+			moved, reason = landNear(target, HOLD.PumpkinNear, true)
+		else
+			moved, reason = floatAbove(target)
+		end
+		if not moved then
+			message = reason
+			return
+		end
+
+		task.wait(HOLD.Settle)
+		if not Running or token ~= Bring.Token then
+			message, stop = "Cancelled", true
+			return
+		end
+		local char, hum = getCharacter()
+		if not char or not hum or hum.Health <= 0 then
+			message, stop = "You died before the shot", true
+			return
+		end
+		if not target:IsDescendantOf(workspace) then
+			message = target.Name .. " unloaded"
+			return
+		end
+
+		local mode = State.PullToCamera and "pull" or "lock"
+		aimCamera(target)
+		if not grabEntity(target, mode) then
+			return
+		end
+		if mode == "pull" then
+			notify("Ready!", false, THEME.Accent)
+		end
+
+		-- A tap is only a try. A picture counts once something a real photo touches reacts:
+		-- the game's remote, your GUI, your stats, the camera going on cooldown, or the target.
+		-- Whatever reacts before the first try is background noise for the rest of the run.
+		local events = {}
+		local lastTry = nil
+		local function listen(signal, source, check)
+			table.insert(watchers, signal:Connect(function()
+				if not check or check() then
+					events[source] = os.clock()
+				end
+			end))
+		end
+		local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if gui then
+			listen(gui.DescendantAdded, "gui")
+		end
+		listen(LocalPlayer.AttributeChanged, "stats")
+		for _, obj in ipairs(LocalPlayer:GetDescendants()) do
+			if obj:IsA("ValueBase") and not (gui and obj:IsDescendantOf(gui)) then
+				listen(obj.Changed, "stats")
+			end
+		end
+		listen(target.AncestryChanged, "target")
+		listen(target.AttributeChanged, "target")
+
+		-- Your own taps count as tries too, so manual shots get confirmed the same way.
+		local tools = {}
+		local function watchTool(obj)
+			if not obj:IsA("Tool") or tools[obj] then
+				return
+			end
+			tools[obj] = true
+			table.insert(watchers, obj.Activated:Connect(function()
+				lastTry = os.clock()
+			end))
+			listen(obj:GetPropertyChangedSignal("Enabled"), "cooldown", function()
+				return not obj.Enabled
+			end)
+		end
+		for _, child in ipairs(char:GetChildren()) do
+			watchTool(child)
+		end
+		table.insert(watchers, char.ChildAdded:Connect(watchTool))
+		table.clear(Bring.RemoteLog)
+
+		local noise = Bring.Noise
+		local function confirmedSince(since)
+			for _, entry in ipairs(Bring.RemoteLog) do
+				local remote, at = entry[1], entry[2]
+				if at >= since and not noise.Remotes[remote] and (not Bring.PhotoRemote or Bring.PhotoRemote == remote) then
+					Bring.PhotoRemote = remote
+					return true
+				end
+			end
+			if Bring.PhotoRemote then
+				return false -- once the photo remote is known, only it counts
+			end
+			for source, at in pairs(events) do
+				if at >= since and not noise.Sources[source] then
+					return true
+				end
+			end
+			return false
+		end
+
+		local hasTool = findCamera(char) ~= nil or findCamera(LocalPlayer:FindFirstChildOfClass("Backpack")) ~= nil
+		local started = os.clock()
+		local baselineEnd = started + HOLD.Baseline
+		local deadline = started + State.PhotoWindow
+		local nextTry = baselineEnd
+		local tries = 0
+		while Running and token == Bring.Token and os.clock() < deadline do
+			local _, alive = getCharacter()
+			if not alive or alive.Health <= 0 then
+				message, stop = "You died before the shot", true
+				return
+			end
+			local now = os.clock()
+			if not lastTry and (hasTool or now < baselineEnd) then
+				for source in pairs(events) do
+					noise.Sources[source] = true
+				end
+				for _, entry in ipairs(Bring.RemoteLog) do
+					noise.Remotes[entry[1]] = true
+				end
+			end
+
+			-- With no camera tool, any proof after the baseline counts, for a screen button shutter.
+			local since = lastTry or (not hasTool and now >= baselineEnd and baselineEnd) or nil
+			if since and confirmedSince(since) then
+				shot = true
+				notify("Picture taken!", false, THEME.Accent)
+				task.wait(HOLD.Grace)
+				break
+			end
+			local held = Bring.Held
+			if not held then
+				break
+			end
+
+			-- Auto shutter: try once the view is clear and the camera is ready.
+			-- No proof within Confirm seconds means the camera was still reloading, so it tries again.
+			if State.AutoShot and now >= nextTry and (held.Mode == "pull" or held.Clear) then
+				local tool = cameraReady()
+				if tool then
+					tries += 1
+					if tries == 2 then
+						notify("Waiting for the camera", true, THEME.Accent)
+					end
+					lastTry = os.clock()
+					tool:Activate()
+					nextTry = os.clock() + HOLD.Confirm
+				else
+					nextTry = os.clock() + 0.2
+				end
+			end
+			task.wait()
+		end
+		if token ~= Bring.Token then
+			message, stop = "Cancelled", true
+		elseif not shot then
+			message = "No shot taken"
+		end
+	end)
+
+	for _, conn in ipairs(watchers) do
+		conn:Disconnect()
+	end
+	pcall(releaseHeld)
+	pcall(stopHover)
+	pcall(restoreCleared)
+	if not ok then
+		warn("[Backrooms] " .. tostring(err))
+		message = "Picture failed"
+	end
+	return shot, message, stop
+end
+
+-- Takes a picture of each target in order from one saved spot, then sends you back there.
+-- onShot runs for every target that got a shot.
+local function runPictures(targets, button, idleText, near, onShot)
+	-- While a run is active its button turns into Cancel.
+	local function paintRunButton(running)
+		local colors = BUTTON_STYLES[running and "danger" or "accent"]
+		button.Text = running and "Cancel" or idleText
+		button.BackgroundColor3 = colors[1]
+		button.TextColor3 = colors[2]
+	end
+
+	Bring.Running = true
+	Bring.Token += 1
+	local token = Bring.Token
+	paintRunButton(true)
+	Bring.Noise = { Remotes = {}, Sources = {} }
+
+	-- Remote watch: logs the game's own FireServer and InvokeServer calls during the run.
+	-- A picture has to reach the server, so a call right after a shot is the strongest proof.
+	-- Needs hookmetamethod. Without it, the other proof signals still work. Removed when the run ends.
+	if not Bring.Unhook and typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
+		local log = Bring.RemoteLog
+		local fromScript = typeof(checkcaller) == "function" and checkcaller or function()
+			return false
+		end
+		local original
+		local function spy(self, ...)
+			local method = getnamecallmethod()
+			if (method == "FireServer" or method == "InvokeServer") and not fromScript() then
+				log[#log + 1] = { self, os.clock() }
+			end
+			return original(self, ...)
+		end
+		if typeof(newcclosure) == "function" then
+			spy = newcclosure(spy)
+		end
+		local hooked, previous = pcall(hookmetamethod, game, "__namecall", spy)
+		if hooked and previous then
+			original = previous
+			Bring.Unhook = function()
+				Bring.Unhook = nil
+				pcall(hookmetamethod, game, "__namecall", previous)
+			end
+		end
+	end
+
+	local _, _, startRoot = getCharacter()
+	local home = startRoot and startRoot.CFrame
+	local savedReturn = ReturnCFrame
+	local total = #targets
+	local shots = 0
+	local message = nil
+	local stopReason = nil
+
+	if not home then
+		message = "Your character is not ready"
+	else
+		for index, target in ipairs(targets) do
+			if not Running or token ~= Bring.Token then
+				break
+			end
+			if target:IsDescendantOf(workspace) then
+				local count = total > 1 and string.format(" (%d/%d)", index, total) or ""
+				notify("Teleporting you to bypass kicks" .. count, true, THEME.Accent)
+				local shot, reason, stop = shootTarget(target, token, near)
+				if shot then
+					shots += 1
+					if onShot then
+						onShot(target)
+					end
+				end
+				message = reason
+				if stop then
+					stopReason = reason
+					break
+				end
+			end
+		end
+		if total > 1 then
+			local summary = string.format("%d of %d pictures taken", shots, total)
+			message = stopReason and (stopReason .. ", " .. summary) or summary
+		end
+	end
+
+	if Bring.Unhook then
+		Bring.Unhook()
+	end
+	table.clear(Bring.RemoteLog)
+	ReturnCFrame = savedReturn
+	Bring.Running = false
+	if not Running then
+		return
+	end
+	paintRunButton(false)
+
+	local returned = false
+	local _, hum, root = getCharacter()
+	if home and hum and root and hum.Health > 0 then
+		root.CFrame = home
+		root.AssemblyLinearVelocity = Vector3.zero
+		returned = true
+	end
+	if returned then
+		message = message and (message .. ", back at your spot") or "Back at your spot"
+	end
+	notify(message or "Stopped")
+	task.spawn(refreshEntityList)
+	task.spawn(refreshPumpkinList)
+end
+
+PictureButton.MouseButton1Click:Connect(function()
+	if Bring.Running then
+		Bring.Token += 1
+		return
+	end
+	if TeleportBusy then
+		return
+	end
+	local target = SelectedEntity
+	if not target then
+		notify("Pick an entity from the list")
+		return
+	end
+	task.spawn(runPictures, { target }, PictureButton, "Auto take picture")
+end)
+
+-- Shoots every loaded pumpkin that is not done yet, nearest first, then sends you back.
+Pumpkin.Button.MouseButton1Click:Connect(function()
+	if Bring.Running then
+		Bring.Token += 1
+		return
+	end
+	if TeleportBusy then
+		return
+	end
+	local list = collectPumpkins()
+	local targets = {}
+	for _, entry in ipairs(list) do
+		if not Pumpkin.Done[entry.Target] then
+			table.insert(targets, entry.Target)
+		end
+	end
+	if #targets == 0 then
+		notify(#list == 0 and "No pumpkins loaded yet" or "Every loaded pumpkin is done")
+		return
+	end
+	task.spawn(runPictures, targets, Pumpkin.Button, "Auto take pictures", true, function(target)
+		Pumpkin.Done[target] = true
+	end)
+end)
 
 local function toggleWindow()
 	Window.Visible = not Window.Visible
@@ -2078,28 +3890,30 @@ end
 makeDraggable(TitleBar, Window)
 HideButton.MouseButton1Click:Connect(toggleWindow)
 
-local OpenButton = create("TextButton", {
-	Name = "Open",
-	Position = UDim2.new(0, 12, 0.25, 0),
-	Size = UDim2.fromOffset(46, 46),
-	BackgroundColor3 = THEME.Window,
-	BackgroundTransparency = 0.05,
-	AutoButtonColor = false,
-	Text = "B",
-	TextColor3 = THEME.Accent,
-	Font = Enum.Font.GothamBold,
-	TextSize = 18,
-	Parent = ScreenGui,
-})
-corner(OpenButton, 23)
-stroke(OpenButton, THEME.Accent, 0.2, 1.5)
+do
+	local OpenButton = create("TextButton", {
+		Name = "Open",
+		Position = UDim2.new(0, 12, 0.25, 0),
+		Size = UDim2.fromOffset(46, 46),
+		BackgroundColor3 = THEME.Window,
+		BackgroundTransparency = 0.05,
+		AutoButtonColor = false,
+		Text = "B",
+		TextColor3 = THEME.Accent,
+		Font = Enum.Font.GothamBold,
+		TextSize = 18,
+		Parent = ScreenGui,
+	})
+	corner(OpenButton, 23)
+	stroke(OpenButton, THEME.Accent, 0.2, 1.5)
 
-local openWasDragged = makeDraggable(OpenButton, OpenButton)
-OpenButton.MouseButton1Click:Connect(function()
-	if not openWasDragged() then
-		toggleWindow()
-	end
-end)
+	local openWasDragged = makeDraggable(OpenButton, OpenButton)
+	OpenButton.MouseButton1Click:Connect(function()
+		if not openWasDragged() then
+			toggleWindow()
+		end
+	end)
+end
 
 track(UserInputService.InputBegan:Connect(function(input, processed)
 	if not processed and input.KeyCode == Enum.KeyCode.RightShift then
@@ -2110,6 +3924,7 @@ end))
 RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Last.Value, applyEnvironment)
 RunService:BindToRenderStep(SWAY_GUARD_NAME, Enum.RenderPriority.Camera.Value - 1, guardCameraOffset)
 RunService:BindToRenderStep(SWAY_FIX_NAME, Enum.RenderPriority.Last.Value + 1000, stabilizeCamera)
+RunService:BindToRenderStep(HOLD_NAME, Enum.RenderPriority.Camera.Value + 1, safePin)
 
 track(RunService.RenderStepped:Connect(function()
 	if State.NoSway then
@@ -2133,12 +3948,16 @@ track(RunService.Heartbeat:Connect(function()
 	if State.Fly then
 		stepFly()
 	end
+	stepHover()
+	safePin()
 end))
 
 track(RunService.Stepped:Connect(function()
-	if State.Noclip then
+	if State.Noclip or Bring.Hover then
 		stepNoclip()
 	end
+	stepHover()
+	safePin()
 end))
 
 track(UserInputService.JumpRequest:Connect(function()
@@ -2161,6 +3980,13 @@ end))
 
 loop(0.5, maintain)
 loop(0.5, refreshEntityList)
+-- Pumpkin scan feeds the list, the ESP and the run.
+loop(1, function()
+	Pumpkin.Targets, Pumpkin.Confirmed = collectPumpkins()
+end)
+loop(0.5, refreshPumpkinList)
+loop(3, Hunt.learn)
+loop(1, Hunt.refresh)
 loop(0.15, function()
 	updateLabels()
 	updateAlert()
@@ -2171,6 +3997,15 @@ local function unload()
 		return
 	end
 	Running = false
+	pcall(releaseHeld)
+	pcall(stopHover)
+	pcall(restoreCleared)
+	if Bring.Unhook then
+		pcall(Bring.Unhook)
+	end
+	if Hunt.State then
+		pcall(Hunt.stop, nil)
+	end
 	for key, handler in pairs(Handlers) do
 		if State[key] then
 			State[key] = false
@@ -2202,9 +4037,11 @@ GlobalEnv.BackroomsUnload = unload
 selectTab("Visuals")
 
 for _, key in ipairs(SAVED_KEYS) do
-	if Saved[key] == true and type(State[key]) == "boolean" then
-		setToggle(key, true)
+	local value = Saved[key]
+	if type(value) == "boolean" and type(State[key]) == "boolean" and value ~= State[key] then
+		setToggle(key, value)
 	end
 end
 
 notify("Backrooms loaded")
+task.spawn(Hunt.resume)
