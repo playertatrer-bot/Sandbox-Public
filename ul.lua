@@ -43,8 +43,9 @@ for _, name in ipairs(EXTRA_ENTITY_NAMES) do
 	EntityNames[name] = true
 end
 
+-- "reload" tells the old copy that a new copy is taking over, so a running hunt carries on.
 if type(GlobalEnv.BackroomsUnload) == "function" then
-	pcall(GlobalEnv.BackroomsUnload)
+	pcall(GlobalEnv.BackroomsUnload, "reload")
 end
 
 for _, child in ipairs(GuiParent:GetChildren()) do
@@ -1330,6 +1331,14 @@ local function hasClearView(entity, origin, center)
 		local part = hit.Instance
 		if not clearing or part:IsA("Terrain") or Bring.Cleared[part] then
 			return false
+		end
+		-- Never hide the floor you stand on. On the ground, losing its collision drops you through it.
+		if not Bring.Hover and part.CanCollide then
+			local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			local below = root and workspace:Raycast(root.Position, Vector3.new(0, -10, 0), Bring.SightRay)
+			if below and below.Instance == part then
+				return false
+			end
 		end
 		local cleared = pcall(function()
 			local decals = {}
@@ -2865,7 +2874,7 @@ function Hunt.hop()
 			end)
 			table.insert(state.Visited, serverId)
 			local waited = 0
-			while sent and waited < 20 and not Hunt.Failed and Hunt.State == state and state.Active and Running do
+			while sent and waited < 30 and not Hunt.Failed and Hunt.State == state and state.Active and Running do
 				task.wait(0.5)
 				waited += 0.5
 			end
@@ -2945,24 +2954,32 @@ function Hunt.start()
 		Hops = 0,
 	}
 	Hunt.save()
+	GlobalEnv.BackroomsHunt = Hunt.State
 	task.spawn(Hunt.run)
 end
 
--- Runs on load. Picks up a hunt carried over from the last server.
--- The saved file wins when it exists, since it holds the latest list of visited servers.
+-- Runs on load. Picks up a hunt from the last server, or from the copy this one replaced.
+-- carried comes from queue_on_teleport, or from getgenv when the script reloads in the same server.
+-- saved is the file. When both hold the same hunt, the file decides, since it records a Stop.
 function Hunt.resume()
 	local carried = GlobalEnv.BackroomsHunt
-	GlobalEnv.BackroomsHunt = nil
 	local saved = Hunt.read(Hunt.StateFile)
-	local fresh = type(saved) == "table" and saved.Active == true
-		and type(saved.Updated) == "number" and os.time() - saved.Updated <= Hunt.Fresh
 	local state = nil
-	if fresh and (type(carried) ~= "table" or carried.Id == saved.Id) then
-		state = saved
-	elseif type(saved) ~= "table" and type(carried) == "table" and carried.Active == true then
-		state = carried
+	if type(carried) == "table" and type(saved) == "table" and carried.Id == saved.Id then
+		if saved.Active == true then
+			state = saved
+		end
+	elseif type(carried) == "table" then
+		if carried.Active == true then
+			state = carried
+		end
+	elseif type(saved) == "table" and saved.Active == true
+		and type(saved.Updated) == "number" and os.time() - saved.Updated <= Hunt.Fresh
+	then
+		state = saved -- autoexec copy with nothing carried over
 	end
 	if not state or type(state.Target) ~= "string" then
+		GlobalEnv.BackroomsHunt = nil
 		return
 	end
 	state.Visited = type(state.Visited) == "table" and state.Visited or {}
@@ -2972,6 +2989,7 @@ function Hunt.resume()
 	end
 	state.Key = type(state.Key) == "string" and state.Key or Hunt.norm(state.Target)
 	Hunt.State = state
+	GlobalEnv.BackroomsHunt = state
 	Hunt.Box.Text = state.Target
 	-- Starts looking right away. The scan does not need your character, and entities
 	-- that load in during the scan still count.
@@ -3992,7 +4010,9 @@ loop(0.15, function()
 	updateAlert()
 end)
 
-local function unload()
+-- reason is "reload" when a new copy of the script replaces this one. The hunt then stays
+-- saved for the new copy. The Unload button passes nothing, which ends the hunt.
+local function unload(reason)
 	if not Running then
 		return
 	end
@@ -4003,7 +4023,7 @@ local function unload()
 	if Bring.Unhook then
 		pcall(Bring.Unhook)
 	end
-	if Hunt.State then
+	if Hunt.State and reason ~= "reload" then
 		pcall(Hunt.stop, nil)
 	end
 	for key, handler in pairs(Handlers) do
