@@ -1272,7 +1272,8 @@ local HOLD = {
 	LockSlack = 6, -- lock mode
 	Settle = 0.4, -- seconds for the server to register a teleport
 	PumpkinNear = 6, -- landing distance from a pumpkin, close enough for a big clear shot
-	Grace = 0.4, -- seconds you stay after a confirmed picture
+	Grace = 1, -- seconds you stay after a confirmed picture, so the capture finishes
+	WeakWait = 2.5, -- seconds a general sound or popup has to wait for camera proof before it counts
 	Confirm = 1.2, -- seconds to wait for proof of a picture before the next try
 	Baseline = 0.3, -- seconds of listening before the first try, to learn background noise
 	CameraWords = { "camera", "cam", "photo", "polaroid", "snap" },
@@ -1660,14 +1661,22 @@ local function landNear(target, distance, keepReturn)
 	return true, string.format("Landed %dm from %s", math.floor((focus - standPos).Magnitude), target.Name)
 end
 
--- Hover: you float Safe distance studs from the entity, eyes a little above its head, and follow
--- it for the whole run. Walls and ceilings do not matter: noclip is on, and Clear view hides
--- whatever sits between you and it. This keeps you out of reach of entities that kill up close,
--- like the BellHop in its narrow hallway.
+-- Hover: you float Safe distance studs from the entity and follow it for the whole run.
+-- Noclip is on, so walls and ceilings do not stop you.
+-- With Hide on (it follows Clear view) you float above the ceiling, feet clear of it, so the
+-- entity has no line of sight to you. Entities like the BellHop lunge at anything they see.
+-- Clear view hides the ceiling on your screen only, so your camera still sees the entity.
 local function hoverPose(hover)
 	local box, size = boundsOf(hover.Target)
 	local center = box.Position
 	local rise = math.clamp(size.Y / 2 + 2, 3, 8)
+	if hover.Hide then
+		local top = center.Y + size.Y / 2
+		local up = workspace:Raycast(Vector3.new(center.X, top + 0.5, center.Z), Vector3.new(0, 40, 0), FloorRay)
+		if up then
+			rise = math.max(rise, up.Position.Y - center.Y + 7)
+		end
+	end
 	local reach = State.SafeDistance
 	local flat = math.sqrt(math.max(reach * reach - rise * rise, 4))
 	local eye = center + hover.Direction * flat + Vector3.new(0, rise, 0)
@@ -1753,17 +1762,19 @@ local function floatAbove(target)
 	local hover = {
 		Target = target,
 		Direction = base,
+		Hide = State.ClearView,
 		Stand = hum.PlatformStand,
 		Touch = {},
 		Hidden = {},
 		Eye = nil,
 	}
-	-- Prefer a side with a clear line from your eyes to the entity. If every side is walled in,
-	-- the spot behind it is used and Clear view handles the walls.
+	-- With Hide, prefer a side where walls or the ceiling block the entity's view of your head and body.
+	-- Without it, prefer a side with a clear view. If no side fits, the spot behind it is used.
 	for _, angle in ipairs(TP_ANGLES) do
 		hover.Direction = CFrame.Angles(0, math.rad(angle), 0):VectorToWorldSpace(base)
 		local _, eye, center = hoverPose(hover)
-		if hasSight(eye, center) then
+		local seen = hasSight(eye, center) or hasSight(eye - Vector3.new(0, 3, 0), center)
+		if (hover.Hide and not seen) or (not hover.Hide and seen) then
 			break
 		end
 		hover.Direction = base
@@ -3542,12 +3553,16 @@ local function shootTarget(target, token, near)
 		end
 
 		-- A tap is only a try. A picture counts once something a real photo touches reacts.
-		-- Reward signals: the game's remote, your stats, the target.
-		-- Camera signals: the shutter sound, the capture animation, the flash, the camera going on
-		-- cooldown, a popup in your GUI. These fire with no reward too, so a picture of an entity
-		-- already in your album still counts.
+		-- Camera proof ends the shot right away: the game's photo request, the camera tool's own
+		-- sound or flash, the camera going on cooldown or changing state, your stats, the target.
+		-- These fire with no reward too, so a picture of an entity already in your album counts.
+		-- General proof (any other sound, a popup, an animation) also fires when an entity spots
+		-- you, so it only counts if no camera proof shows up within WeakWait seconds. The camera
+		-- keeps trying during that wait.
 		-- Whatever reacts before the first try is background noise for the rest of the run.
+		local WEAK = { gui = true, sound = true, anim = true }
 		local events = {}
+		local weakAt = nil
 		local lastTry = nil
 		local noise = Bring.Noise
 		local hasTool = findCamera(char) ~= nil or findCamera(LocalPlayer:FindFirstChildOfClass("Backpack")) ~= nil
@@ -3582,12 +3597,21 @@ local function shootTarget(target, token, near)
 		listen(target.AttributeChanged, "target")
 
 		-- Sounds count one by one: any sound that plays before the first try is noise from then on.
-		-- Your character's footstep and fall sounds never count.
-		local function onSound(sound)
+		-- Your character's footstep and fall sounds never count. Sounds inside the camera tool are
+		-- camera proof, everything else is general proof.
+		local function onSound(sound, source)
 			if not live() then
 				noise.Sounds[sound] = true
 			elseif not noise.Sounds[sound] then
-				events.sound = os.clock()
+				events[source] = os.clock()
+			end
+		end
+		local function hookSound(sound, source)
+			table.insert(watchers, sound.Played:Connect(function()
+				onSound(sound, source)
+			end))
+			if sound.IsPlaying then
+				onSound(sound, source)
 			end
 		end
 		local function watchSounds(container)
@@ -3595,13 +3619,10 @@ local function shootTarget(target, token, near)
 				return
 			end
 			local function hook(obj)
-				if obj:IsA("Sound") and not (obj.Parent and obj.Parent.Name == "HumanoidRootPart") then
-					table.insert(watchers, obj.Played:Connect(function()
-						onSound(obj)
-					end))
-					if obj.IsPlaying then
-						onSound(obj)
-					end
+				if obj:IsA("Sound") and not (obj.Parent and obj.Parent.Name == "HumanoidRootPart")
+					and not obj:FindFirstAncestorOfClass("Tool")
+				then
+					hookSound(obj, "sound")
 				end
 			end
 			for _, obj in ipairs(container:GetDescendants()) do
@@ -3652,13 +3673,27 @@ local function shootTarget(target, token, near)
 			listen(obj:GetPropertyChangedSignal("Enabled"), "cooldown", function()
 				return not obj.Enabled
 			end)
-			for _, light in ipairs(obj:GetDescendants()) do
-				if light:IsA("Light") then
-					listen(light:GetPropertyChangedSignal("Enabled"), "flash", function()
-						return light.Enabled
+			-- Tool state changes only count right after a try, so a cooldown ending is not mistaken for a shot.
+			local function recentTry()
+				return lastTry ~= nil and os.clock() - lastTry <= HOLD.Confirm
+			end
+			listen(obj.AttributeChanged, "toolstate", recentTry)
+			for _, item in ipairs(obj:GetDescendants()) do
+				if item:IsA("Light") then
+					listen(item:GetPropertyChangedSignal("Enabled"), "flash", function()
+						return item.Enabled
 					end)
+				elseif item:IsA("Sound") then
+					hookSound(item, "toolsound")
+				elseif item:IsA("ValueBase") then
+					listen(item.Changed, "toolstate", recentTry)
 				end
 			end
+			table.insert(watchers, obj.DescendantAdded:Connect(function(item)
+				if item:IsA("Sound") then
+					hookSound(item, "toolsound")
+				end
+			end))
 		end
 		for _, child in ipairs(char:GetChildren()) do
 			watchTool(child)
@@ -3666,21 +3701,26 @@ local function shootTarget(target, token, near)
 		table.insert(watchers, char.ChildAdded:Connect(watchTool))
 		table.clear(Bring.RemoteLog)
 
-		-- Once the photo remote is known, other remotes stop counting. Every other signal still counts.
+		-- Returns "camera" for camera proof, "general" for general proof only, or nil.
+		-- Once the photo remote is known, other remotes stop counting.
 		local function confirmedSince(since)
 			for _, entry in ipairs(Bring.RemoteLog) do
 				local remote, at = entry[1], entry[2]
 				if at >= since and not noise.Remotes[remote] and (not Bring.PhotoRemote or Bring.PhotoRemote == remote) then
 					Bring.PhotoRemote = remote
-					return true
+					return "camera"
 				end
 			end
+			local general = false
 			for source, at in pairs(events) do
 				if at >= since and not noise.Sources[source] then
-					return true
+					if not WEAK[source] then
+						return "camera"
+					end
+					general = true
 				end
 			end
-			return false
+			return general and "general" or nil
 		end
 		while Running and token == Bring.Token and os.clock() < deadline do
 			local _, alive = getCharacter()
@@ -3700,7 +3740,11 @@ local function shootTarget(target, token, near)
 
 			-- With no camera tool, any proof after the baseline counts, for a screen button shutter.
 			local since = lastTry or (not hasTool and now >= baselineEnd and baselineEnd) or nil
-			if since and confirmedSince(since) then
+			local proof = since and confirmedSince(since) or nil
+			if proof == "general" and not weakAt then
+				weakAt = now
+			end
+			if proof == "camera" or (weakAt and now - weakAt >= HOLD.WeakWait) then
 				shot = true
 				notify("Picture taken!", false, THEME.Accent)
 				task.wait(HOLD.Grace)
@@ -3731,6 +3775,8 @@ local function shootTarget(target, token, near)
 		end
 		if token ~= Bring.Token then
 			message, stop = "Cancelled", true
+		elseif not shot and weakAt then
+			shot = true -- general proof that ran out of time still counts
 		elseif not shot then
 			message = "No shot taken"
 		end
