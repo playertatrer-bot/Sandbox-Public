@@ -80,7 +80,7 @@ local State = {
 	AlertRange = 60,
 	TpDistance = 30,
 	PullToCamera = false,
-	FloatHeight = 12,
+	SafeDistance = 15,
 	PhotoWindow = 8,
 	AutoShot = true,
 	ClearView = true,
@@ -95,14 +95,14 @@ local RANGES = {
 	FlySpeed = { 10, 300, 5 },
 	AlertRange = { 20, 300, 10 },
 	TpDistance = { 10, 100, 5 },
-	FloatHeight = { 4, 30, 1 },
+	SafeDistance = { 10, 20, 1 },
 	PhotoWindow = { 3, 20, 1 },
 }
 
 local SAVED_KEYS = {
 	"Fullbright", "NoFog", "CustomFov", "FovValue", "FirstPerson", "NoSway",
 	"SpeedValue", "FlySpeed", "PlayerESP", "EntityESP", "ItemESP",
-	"EntityAlert", "AlertRange", "TpDistance", "PullToCamera", "FloatHeight", "PhotoWindow", "AutoShot",
+	"EntityAlert", "AlertRange", "TpDistance", "PullToCamera", "SafeDistance", "PhotoWindow", "AutoShot",
 	"ClearView", "PumpkinESP", "InstantInteract", "AntiAfk",
 }
 
@@ -756,7 +756,7 @@ local Bring = {
 	Token = 0, -- bumps on cancel
 	Cleared = {}, -- parts hidden on your screen for the shot, with their saved state
 	RemoteLog = {}, -- remote calls the game made during the current shot, as { remote, time }
-	Noise = { Remotes = {}, Sources = {} }, -- signals that fire on their own, ignored as proof
+	Noise = { Remotes = {}, Sources = {}, Sounds = {}, Anims = {} }, -- signals that fire on their own, ignored as proof
 	PhotoRemote = nil, -- the remote that proved a picture, learned on the first confirmed shot
 	Unhook = nil, -- removes the remote watch
 }
@@ -1272,7 +1272,6 @@ local HOLD = {
 	LockSlack = 6, -- lock mode
 	Settle = 0.4, -- seconds for the server to register a teleport
 	PumpkinNear = 6, -- landing distance from a pumpkin, close enough for a big clear shot
-	MinGap = 2, -- smallest gap between the entity's head and your feet when floating
 	Grace = 0.4, -- seconds you stay after a confirmed picture
 	Confirm = 1.2, -- seconds to wait for proof of a picture before the next try
 	Baseline = 0.3, -- seconds of listening before the first try, to learn background noise
@@ -1661,35 +1660,19 @@ local function landNear(target, distance, keepReturn)
 	return true, string.format("Landed %dm from %s", math.floor((focus - standPos).Magnitude), target.Name)
 end
 
--- Float: hover over the entity and follow it for the whole run. You never touch the ground near it.
--- Room above: upright, Float height over its head, leaning a few studs so the camera looks down at an angle.
--- Low ceiling: lying flat face down between its head and the ceiling, camera pinned at your head.
--- Noclip and no-touch stay on until the run ends.
+-- Hover: you float Safe distance studs from the entity, eyes a little above its head, and follow
+-- it for the whole run. Walls and ceilings do not matter: noclip is on, and Clear view hides
+-- whatever sits between you and it. This keeps you out of reach of entities that kill up close,
+-- like the BellHop in its narrow hallway.
 local function hoverPose(hover)
 	local box, size = boundsOf(hover.Target)
 	local center = box.Position
-	local top = center.Y + size.Y / 2
-	local hit = workspace:Raycast(
-		Vector3.new(center.X, top + 0.5, center.Z),
-		Vector3.new(0, hover.FloatHeight + hover.Height + 4, 0),
-		FloorRay
-	)
-	local room = hit and (hit.Position.Y - top) or math.huge
-	local dir = hover.Direction
-
-	if room >= hover.Height + HOLD.MinGap + 1 then
-		local gap = math.min(hover.FloatHeight, room - hover.Height - 1)
-		local lean = math.clamp(gap * 0.5, 2, 6)
-		local rootPos = Vector3.new(center.X, top + gap + hover.Lift, center.Z) + dir * lean
-		local head = rootPos + Vector3.new(0, 1.5, 0)
-		return CFrame.lookAt(rootPos, Vector3.new(center.X, rootPos.Y, center.Z)), head, center
-	end
-
-	local rootPos = Vector3.new(center.X, top + math.max(1.5, room / 2), center.Z)
-	local eye = rootPos + dir * 1.5
-	local ceiling = top + room
-	eye = Vector3.new(eye.X, math.clamp(eye.Y, top + 0.75, math.max(top + 0.75, ceiling - 0.5)), eye.Z)
-	return CFrame.lookAt(rootPos, rootPos - Vector3.yAxis, dir), eye, center
+	local rise = math.clamp(size.Y / 2 + 2, 3, 8)
+	local reach = State.SafeDistance
+	local flat = math.sqrt(math.max(reach * reach - rise * rise, 4))
+	local eye = center + hover.Direction * flat + Vector3.new(0, rise, 0)
+	local rootPos = eye - Vector3.new(0, 1.5, 0)
+	return CFrame.lookAt(rootPos, Vector3.new(center.X, rootPos.Y, center.Z)), eye, center
 end
 
 local function stepHover()
@@ -1754,7 +1737,7 @@ local function stopHover()
 	end
 end
 
--- Starts the hover over the entity. Returns true, or false with a reason.
+-- Starts the hover at a safe distance from the entity. Returns true, or false with a reason.
 local function floatAbove(target)
 	local targetRoot, reason = resolveTarget(target)
 	if not targetRoot then
@@ -1769,16 +1752,14 @@ local function floatAbove(target)
 	local base = flatUnit(-targetRoot.CFrame.LookVector) or Vector3.new(1, 0, 0)
 	local hover = {
 		Target = target,
-		FloatHeight = State.FloatHeight,
-		Height = math.clamp(char:GetExtentsSize().Y - 0.5, 3, 7),
-		Lift = rootHeight(hum, root) + 0.25,
 		Direction = base,
 		Stand = hum.PlatformStand,
 		Touch = {},
 		Hidden = {},
 		Eye = nil,
 	}
-	-- Pick the lean direction with a clear line from your head to the entity.
+	-- Prefer a side with a clear line from your eyes to the entity. If every side is walled in,
+	-- the spot behind it is used and Clear view handles the walls.
 	for _, angle in ipairs(TP_ANGLES) do
 		hover.Direction = CFrame.Angles(0, math.rad(angle), 0):VectorToWorldSpace(base)
 		local _, eye, center = hoverPose(hover)
@@ -2428,7 +2409,7 @@ addSlider(MovementTab, "Teleport distance", "TpDistance", "m")
 addSection(MovementTab, "Auto picture")
 addToggle(MovementTab, "Auto shutter", "AutoShot")
 addToggle(MovementTab, "Clear view", "ClearView")
-addSlider(MovementTab, "Float height", "FloatHeight", "m")
+addSlider(MovementTab, "Safe distance", "SafeDistance", "m")
 addSlider(MovementTab, "Photo window", "PhotoWindow", "s")
 addToggle(MovementTab, "Pull to camera", "PullToCamera")
 
@@ -3560,11 +3541,26 @@ local function shootTarget(target, token, near)
 			notify("Ready!", false, THEME.Accent)
 		end
 
-		-- A tap is only a try. A picture counts once something a real photo touches reacts:
-		-- the game's remote, your GUI, your stats, the camera going on cooldown, or the target.
+		-- A tap is only a try. A picture counts once something a real photo touches reacts.
+		-- Reward signals: the game's remote, your stats, the target.
+		-- Camera signals: the shutter sound, the capture animation, the flash, the camera going on
+		-- cooldown, a popup in your GUI. These fire with no reward too, so a picture of an entity
+		-- already in your album still counts.
 		-- Whatever reacts before the first try is background noise for the rest of the run.
 		local events = {}
 		local lastTry = nil
+		local noise = Bring.Noise
+		local hasTool = findCamera(char) ~= nil or findCamera(LocalPlayer:FindFirstChildOfClass("Backpack")) ~= nil
+		local started = os.clock()
+		local baselineEnd = started + HOLD.Baseline
+		local deadline = started + State.PhotoWindow
+		local nextTry = baselineEnd
+		local tries = 0
+		-- Past the baseline: a try happened, or with no camera tool, the baseline time ran out.
+		local function live()
+			return lastTry ~= nil or (not hasTool and os.clock() >= baselineEnd)
+		end
+
 		local function listen(signal, source, check)
 			table.insert(watchers, signal:Connect(function()
 				if not check or check() then
@@ -3585,6 +3581,64 @@ local function shootTarget(target, token, near)
 		listen(target.AncestryChanged, "target")
 		listen(target.AttributeChanged, "target")
 
+		-- Sounds count one by one: any sound that plays before the first try is noise from then on.
+		-- Your character's footstep and fall sounds never count.
+		local function onSound(sound)
+			if not live() then
+				noise.Sounds[sound] = true
+			elseif not noise.Sounds[sound] then
+				events.sound = os.clock()
+			end
+		end
+		local function watchSounds(container)
+			if not container then
+				return
+			end
+			local function hook(obj)
+				if obj:IsA("Sound") and not (obj.Parent and obj.Parent.Name == "HumanoidRootPart") then
+					table.insert(watchers, obj.Played:Connect(function()
+						onSound(obj)
+					end))
+					if obj.IsPlaying then
+						onSound(obj)
+					end
+				end
+			end
+			for _, obj in ipairs(container:GetDescendants()) do
+				hook(obj)
+			end
+			table.insert(watchers, container.DescendantAdded:Connect(hook))
+		end
+		watchSounds(gui)
+		watchSounds(game:GetService("SoundService"))
+		watchSounds(workspace.CurrentCamera)
+		watchSounds(char)
+
+		-- Animations count one by one too. Walk, idle and the other default animations never count.
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			local defaults = {}
+			local animate = char:FindFirstChild("Animate")
+			if animate then
+				for _, obj in ipairs(animate:GetDescendants()) do
+					if obj:IsA("Animation") then
+						defaults[obj.AnimationId] = true
+					end
+				end
+			end
+			table.insert(watchers, animator.AnimationPlayed:Connect(function(track)
+				local id = track.Animation and track.Animation.AnimationId or ""
+				if defaults[id] then
+					return
+				end
+				if not live() then
+					noise.Anims[id] = true
+				elseif not noise.Anims[id] then
+					events.anim = os.clock()
+				end
+			end))
+		end
+
 		-- Your own taps count as tries too, so manual shots get confirmed the same way.
 		local tools = {}
 		local function watchTool(obj)
@@ -3598,6 +3652,13 @@ local function shootTarget(target, token, near)
 			listen(obj:GetPropertyChangedSignal("Enabled"), "cooldown", function()
 				return not obj.Enabled
 			end)
+			for _, light in ipairs(obj:GetDescendants()) do
+				if light:IsA("Light") then
+					listen(light:GetPropertyChangedSignal("Enabled"), "flash", function()
+						return light.Enabled
+					end)
+				end
+			end
 		end
 		for _, child in ipairs(char:GetChildren()) do
 			watchTool(child)
@@ -3605,7 +3666,7 @@ local function shootTarget(target, token, near)
 		table.insert(watchers, char.ChildAdded:Connect(watchTool))
 		table.clear(Bring.RemoteLog)
 
-		local noise = Bring.Noise
+		-- Once the photo remote is known, other remotes stop counting. Every other signal still counts.
 		local function confirmedSince(since)
 			for _, entry in ipairs(Bring.RemoteLog) do
 				local remote, at = entry[1], entry[2]
@@ -3614,9 +3675,6 @@ local function shootTarget(target, token, near)
 					return true
 				end
 			end
-			if Bring.PhotoRemote then
-				return false -- once the photo remote is known, only it counts
-			end
 			for source, at in pairs(events) do
 				if at >= since and not noise.Sources[source] then
 					return true
@@ -3624,13 +3682,6 @@ local function shootTarget(target, token, near)
 			end
 			return false
 		end
-
-		local hasTool = findCamera(char) ~= nil or findCamera(LocalPlayer:FindFirstChildOfClass("Backpack")) ~= nil
-		local started = os.clock()
-		local baselineEnd = started + HOLD.Baseline
-		local deadline = started + State.PhotoWindow
-		local nextTry = baselineEnd
-		local tries = 0
 		while Running and token == Bring.Token and os.clock() < deadline do
 			local _, alive = getCharacter()
 			if not alive or alive.Health <= 0 then
@@ -3713,7 +3764,7 @@ local function runPictures(targets, button, idleText, near, onShot)
 	Bring.Token += 1
 	local token = Bring.Token
 	paintRunButton(true)
-	Bring.Noise = { Remotes = {}, Sources = {} }
+	Bring.Noise = { Remotes = {}, Sources = {}, Sounds = {}, Anims = {} }
 
 	-- Remote watch: logs the game's own FireServer and InvokeServer calls during the run.
 	-- A picture has to reach the server, so a call right after a shot is the strongest proof.
